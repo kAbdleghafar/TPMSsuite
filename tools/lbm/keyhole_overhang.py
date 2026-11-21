@@ -65,7 +65,8 @@ def build(a):
     fill[1:-1, 1:-1, nb + npw + 1:nb + npw + nsl + 1] = 1.0                   # the slab
     md = FreeSurfaceMeltPool(CM.material(), dx, fill, dt=a.dt or dx / 250.0, viscosity=MELT["viscosity"],
                              sigma=MELT["sigma"], mushy_C=1e9, T0=a.T0, T_max=9000.0, dsigma_dT=MELT["dsigma_dT"],
-                             evaporation=EVAP, recoil_factor=0.54, emissivity=0.4, energy_transport="lbm")
+                             evaporation=EVAP, recoil_factor=0.54, emissivity=0.4, energy_transport="lbm",
+                             dtype=np.dtype(a.dtype).type)
     md.rays = RayTracer(A0=ETA_M)
     md.ray_every = a.ray_every
     md.bubbles = BubbleModel(min_cells=2, open_sides=True)      # the powder's gas is open through the bed
@@ -99,12 +100,23 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--checkpoint", type=float, default=20.0)
     ap.add_argument("--redo", action="store_true", help="rerun a case that has already finished")
+    ap.add_argument("--dtype", default="float64", choices=["float64", "float32"],
+                    help="float32: several times faster on GeForce GPUs; results go to *_f32* files")
+    ap.add_argument("--profile", type=int, default=0, metavar="N",
+                    help="time N steps (after 30 warm-up steps), print where the time goes, and exit")
     ap.add_argument("--backend", default=None)
     ap.add_argument("--out", default=os.path.join(HERE, "keyhole_runs"))
     a = ap.parse_args()
     md, path, laser, info = build(a)
     os.makedirs(a.out, exist_ok=True)
-    tag = f"overhang_slab{a.slab * 1e6:.0f}um_dx{a.dx * 1e6:g}um"
+    tag = f"overhang_slab{a.slab * 1e6:.0f}um_dx{a.dx * 1e6:g}um" + ("_f32" if a.dtype == "float32" else "")
+    info["dtype"] = a.dtype
+    if a.profile:
+        from lbm_profile import profile, report
+        r = profile(md, laser, path, a.profile)
+        report(r)
+        json.dump(dict(case=tag, **r), open(os.path.join(a.out, f"{tag}_profile.json"), "w"), indent=1)
+        return
     js, npz, ck = (os.path.join(a.out, f"{tag}{s}") for s in (".json", "_sections.npz", "_checkpoint.npz"))
     if not a.redo and not os.path.exists(ck) and os.path.exists(js) and json.load(open(js)).get("finished"):
         print(f"{tag}: already finished ({js}); --redo to run it again", flush=True)

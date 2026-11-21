@@ -504,6 +504,27 @@ The study's settings are 85 µm hatch, one contour, 0.75 m/s.
   * The constant-Ke turn, and M100 and M300.
 
 
+**Precision: can the remaining runs use float32?**
+* **Why.** GeForce cards (the RTX 4070 SUPER here) run float64 at 1/64 of their float32 rate,
+  and the runs so far used float64. The fused CUDA kernels also compile for float32, and on the
+  3-D phase field float32 was 46× faster. If float32 reproduces the float64 results, the
+  remaining batch can run several times faster on the same card, with no rented GPU.
+* **How.** `--dtype float32` on `keyhole_ti64.py` and `keyhole_overhang.py`; results go to
+  `*_f32*` files. `--profile N` times N steps and prints where each step's time goes (lattice
+  kernel, heat, surface terms, ray tracer, bubbles). `bash tools/lbm/run_closed_keyhole_gpu.sh
+  precision` profiles M200 in both precisions, reruns T3 abrupt and ramped in float32, and
+  compares them with the float64 runs (`tools/lbm/compare_precision.py`).
+* **The test.** A keyhole is chaotic, so time series are not compared point by point. float32
+  passes if:
+  * the steady depth is within 5 %;
+  * the depths after the turn-off and the end crater are within 10 µm or 15 %;
+  * the absorbed fraction is within 0.03;
+  * the number of pores is the same;
+  * mass is conserved to 1e-5 and the booked energy residual stays below 1 %.
+* **CPU check (small keyhole, 5 µm, 20 µs).** The depth follows float64 within 1–3 µm (49.6
+  against 48.6 µm at the end); mass error 4e-7 against 1e-13; booked energy residual 1.6 %
+  against 1.2 %. The GPU comparison of T3 decides.
+
 ### 2. Collapse while scanning
 
 * **Which runs.** In the steady X-ray cases, T5 (Ke 15) and T6 (Ke 21) straddle Gan's pore

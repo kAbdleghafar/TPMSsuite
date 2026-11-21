@@ -119,7 +119,8 @@ def build(args):
     dt = args.dt or dx / 250.0
     md = FreeSurfaceMeltPool(TM.material(), dx, metal, dt=dt, viscosity=d["viscosity_Pa_s"], sigma=d["sigma_N_m"],
                              mushy_C=1e9, T0=25.0, T_max=9000.0, dsigma_dT=d["dsigma_dT"], evaporation=TM.evaporation(),
-                             recoil_factor=0.54, emissivity=d["emissivity"], energy_transport="lbm")
+                             recoil_factor=0.54, emissivity=d["emissivity"], energy_transport="lbm",
+                             dtype=np.dtype(args.dtype).type)
     md.rays = RayTracer(A0=d["eta_min"], k_over_n=args.k_over_n)
     md.ray_every = args.ray_every
     if not args.no_bubbles:
@@ -154,7 +155,7 @@ def build(args):
     z_surf = (npl + 1) * dx
     info = dict(case=args.case, scenario=scen, P=P, v=v, r0=r0, dx=dx, dt=dt, shape=list(n), plate=plate,
                 z_surface=z_surf, y=y, measured_depth=meas["e_m"] if meas else None,
-                measured_eta=meas["eta"] if meas else None, Ke=ke_steady(P, v, r0)[0], **extra)
+                measured_eta=meas["eta"] if meas else None, Ke=ke_steady(P, v, r0)[0], dtype=args.dtype, **extra)
     return md, path, Laser(P, 0.0, r0), info
 
 
@@ -189,6 +190,10 @@ def main():
     ap.add_argument("--no-bubbles", action="store_true")
     ap.add_argument("--checkpoint", type=float, default=20.0, help="minutes between checkpoints")
     ap.add_argument("--redo", action="store_true", help="rerun a case that has already finished")
+    ap.add_argument("--dtype", default="float64", choices=["float64", "float32"],
+                    help="float32: several times faster on GeForce GPUs; results go to *_f32* files")
+    ap.add_argument("--profile", type=int, default=0, metavar="N",
+                    help="time N steps (after 30 warm-up steps), print where the time goes, and exit")
     ap.add_argument("--backend", default=None)
     ap.add_argument("--out", default=os.path.join(HERE, "keyhole_runs"))
     args = ap.parse_args()
@@ -196,6 +201,14 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     tag = (f"{args.case}_dx{args.dx * 1e6:g}um" if info["scenario"] == "track"
            else f"{args.case}_{info['scenario']}_dx{args.dx * 1e6:g}um")
+    if args.dtype == "float32":
+        tag += "_f32"
+    if args.profile:
+        from lbm_profile import profile, report
+        r = profile(md, laser, path, args.profile)
+        report(r)
+        json.dump(dict(case=tag, **r), open(os.path.join(args.out, f"{tag}_profile.json"), "w"), indent=1)
+        return
     js, npz, ck = (os.path.join(args.out, f"{tag}{s}") for s in (".json", "_sections.npz", "_checkpoint.npz"))
     if not args.redo and not os.path.exists(ck) and os.path.exists(js) and json.load(open(js)).get("finished"):
         print(f"{tag}: already finished ({js}); --redo to run it again", flush=True)

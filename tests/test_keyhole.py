@@ -289,3 +289,33 @@ def test_melt_diagnostics_counts_metal_only_and_separates_droplets():
     assert d["drop_volume_um3"] == pytest.approx(8 * 0.8)
     assert d["u_max_all"] == pytest.approx(30.0)
     assert d["u_max_all_at_um"] == pytest.approx([4.5, 4.5, 12.5])
+
+
+def test_float32_keyhole_conserves():
+    """The keyhole melt pool in float32 (the fast mode on GeForce GPUs): mass to 1e-5, the energy
+    balance closes on the booked residual, and the keyhole deepens as in float64."""
+    import tpmsfem as tf
+    from tpmsfem.fem.materials import ThermalProperties
+    from tpmsfem.process import Evaporation, Laser, ScanVector
+    from tpmsfem.process.freesurface import FreeSurfaceMeltPool
+    from tpmsfem.process.keyhole import keyhole_metrics
+
+    th = ThermalProperties.from_si([0.0, 20000.0], [30.0, 30.0], [800.0, 800.0], 4000.0, 2.9e5, 1600.0, 1660.0)
+    mat = tf.Material("const", 110_000.0, 0.3, thermal=th)
+    h = 5e-6
+    depth = {}
+    for dt_ in (np.float64, np.float32):
+        metal = np.zeros((22, 18, 22), bool)
+        metal[1:-1, 1:-1, 1:13] = True
+        md = FreeSurfaceMeltPool(mat, h, metal, dt=h / 250, viscosity=3e-3, sigma=1.6, T0=25.0, T_max=8000.0,
+                                 dsigma_dT=-2.6e-4, evaporation=Evaporation(T_boil=3290.0, L_v=9.3e6, M=0.048),
+                                 energy_transport="lbm", dtype=dt_)
+        md.rays = RayTracer(A0=0.26)
+        md.ray_every = 5
+        md.lbm.smagorinsky = 0.15
+        res = md.run(Laser(300.0, 0.0, 25e-6), [ScanVector(h + 40e-6, 9 * h, h + 60e-6, 9 * h, 2.0)])
+        depth[dt_] = keyhole_metrics(md, h + 60e-6, 9 * h, 25e-6, 13 * h)["depth"]
+        assert abs(res.mass_error) < (1e-12 if dt_ is np.float64 else 1e-5)
+        assert abs(res.energy_balance + res.energy_residual) < (1e-9 if dt_ is np.float64 else 1e-4)
+    assert depth[np.float64] > 15e-6
+    assert depth[np.float32] == pytest.approx(depth[np.float64], abs=5e-6)
