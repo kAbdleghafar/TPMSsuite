@@ -101,7 +101,10 @@ def build(args):
     T_dec = v / accel
     if turn:                                     # full speed, deceleration to the reversal, and back
         run_len = args.approach * v + 0.5 * v * T_dec
-        lx = args.lead + run_len + args.tail
+        back_len = 0.5 * v * T_dec + args.depart * v   # the return leg: acceleration, then full speed
+        # the domain holds both legs with ``lead`` clear of the wall at the start of the approach
+        # and at the end of the return (which is longer when depart > approach)
+        lx = args.lead + max(run_len, back_len) + args.tail
         e_exp = 2.0 * e_exp                      # the keyhole deepens in the turn
     else:
         lx = args.lead + args.track + args.tail
@@ -110,6 +113,8 @@ def build(args):
     if args.plate is None and turn:              # Martin et al.: 500 um plates; 400 um holds the turn keyhole
         args.plate = 400e-6
     plate = args.plate or max(250e-6, 1.5 * e_exp + 80e-6)
+    if args.gas is None:                         # melt piles up at the reversal: 50 um was reached at M200
+        args.gas = 150e-6 if turn else 50e-6
     ly = 2 * args.half_width + (args.hatch if turn else 0.0)
     n = (int(round(lx / dx)) + 2, int(round(ly / dx)) + 2, int(round((plate + args.gas) / dx)) + 2)
     npl = int(round(plate / dx))
@@ -139,7 +144,8 @@ def build(args):
         extra.update(ramp=args.ramp)
     elif turn:
         y = dx + args.half_width                  # first track; the return track is a hatch higher
-        x_turn = x0 + run_len
+        x_turn = x0 + max(run_len, back_len)      # the return ends at x0 or later
+        x0 = x_turn - run_len
         power = None
         if scen == "turn-ke":
             Ke0, kw = ke_steady(P, v, r0)
@@ -149,7 +155,8 @@ def build(args):
         path, t_start = turn_point(x_turn, y, v, args.hatch, accel, approach=args.approach, depart=args.depart,
                                    dt_seg=args.seg_time, power=power)
         extra.update(accel=accel, hatch=args.hatch, x_turn=x_turn, t_turn=-t_start,
-                     approach=args.approach, depart=args.depart)
+                     approach=args.approach, depart=args.depart, y_return=y + args.hatch, x_start=x0,
+                     x_end=x_turn - back_len)
     else:
         raise ValueError(scen)
     z_surf = (npl + 1) * dx
@@ -179,7 +186,7 @@ def main():
     ap.add_argument("--tail", type=float, default=150e-6)
     ap.add_argument("--half-width", type=float, default=None, help="[m] default 150 um; 100 um for M cases")
     ap.add_argument("--plate", type=float, default=None)
-    ap.add_argument("--gas", type=float, default=50e-6)
+    ap.add_argument("--gas", type=float, default=None, help="[m] gas above the plate; default 50 um, 150 um for turns")
     ap.add_argument("--cool", type=float, default=100e-6, help="cooling time after the track [s]")
     ap.add_argument("--every", type=int, default=0, help="diagnostics every N steps (default: 1 us)")
     ap.add_argument("--ray-every", type=int, default=10)
@@ -214,24 +221,35 @@ def main():
         print(f"{tag}: already finished ({js}); --redo to run it again", flush=True)
         return
     log, sections = [], []
+    if os.path.exists(ck) and os.path.exists(js):
+        old = json.load(open(js)).get("shape")
+        if old is not None and list(old) != list(info["shape"]):
+            sys.exit(f"{tag}: the checkpoint is for a {old} domain, this script now builds {info['shape']}. "
+                     f"Move {ck} away (or delete it) to start again with the new domain.")
     if os.path.exists(ck):
         md.load_state(ck)
         if os.path.exists(js):
             log = json.load(open(js)).get("log", [])
         if os.path.exists(npz):
             z = np.load(npz)
-            sections = [(float(t), z["fill"][i], z["T"][i]) for i, t in enumerate(z["t"])]
+            sections = [(float(t), z["fill"][i], z["T"][i]) + ((z["fill_return"][i], z["T_return"][i])
+                                                                  if "fill_return" in z.files else ())
+                        for i, t in enumerate(z["t"])]
         print(f"resumed at t = {md.t * 1e6:.1f} us", flush=True)
     every = args.every or max(1, int(round(1e-6 / info["dt"])))
     jc = int(round(info["y"] / info["dx"]))
+    jr = int(round(info["y_return"] / info["dx"])) if "y_return" in info else None   # turns: the return track
     t_wall = [time.time(), time.time()]
 
     def save():
         info.update(log=log, finished=False)
         json.dump(info, open(js, "w"), indent=1)
         if sections:
+            ret = {}
+            if all(len(s) == 5 for s in sections):
+                ret = dict(fill_return=np.stack([s[3] for s in sections]), T_return=np.stack([s[4] for s in sections]))
             np.savez_compressed(npz, t=np.array([s[0] for s in sections]),
-                                fill=np.stack([s[1] for s in sections]), T=np.stack([s[2] for s in sections]))
+                                fill=np.stack([s[1] for s in sections]), T=np.stack([s[2] for s in sections]), **ret)
 
     last = {}
 
@@ -256,8 +274,12 @@ def main():
                    mass=float(m.lbm.total_mass()), wall_s=time.time() - t_wall[0])
         log.append(row)
         # the section's temperature only where there is metal (emptied cells keep a stale T): NaN elsewhere
-        T_sec = np.where(asnumpy(m.metal()[:, jc, :]), asnumpy(m.T[:, jc, :]), np.nan)
-        sections.append((t, asnumpy(m.lbm.fill[:, jc, :]).astype(np.float16), T_sec.astype(np.float16)))
+        metal = m.metal()
+        sec = (t,)
+        for j in ((jc,) if jr is None else (jc, jr)):
+            T_sec = np.where(asnumpy(metal[:, j, :]), asnumpy(m.T[:, j, :]), np.nan)
+            sec += (asnumpy(m.lbm.fill[:, j, :]).astype(np.float16), T_sec.astype(np.float16))
+        sections.append(sec)
         if len(log) % 10 == 0:
             d = row.get("depth", float("nan"))
             print(f"t {t * 1e6:7.1f} us  depth {d * 1e6:6.1f} um  absorbed {row.get('ray_absorbed', float('nan')):.2f}  "
