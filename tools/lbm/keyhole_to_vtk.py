@@ -131,11 +131,12 @@ def main():
     by_t = {round(r["t"] * 1e9): r for r in log}
     written = []
     if os.path.exists(base + "_sections.npz"):
-        s = np.load(base + "_sections.npz")
+        with np.load(base + "_sections.npz") as zs:  # decompress each array once, not per frame
+            s = {k: zs[k] for k in zs.files}
         d = os.path.join(out, f"{tag}_vtk")
         os.makedirs(d, exist_ok=True)
         planes = [("fill", "T", info["y"], "section", "")]
-        if "fill_return" in s.files and "y_return" in info:      # turn runs: also the return track
+        if "fill_return" in s and "y_return" in info:      # turn runs: also the return track
             planes.append(("fill_return", "T_return", info["y_return"], "return", "_return"))
         for kf, kT, y_plane, stem, suffix in planes:
             j = int(round(y_plane / info["dx"]))
