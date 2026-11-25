@@ -279,3 +279,53 @@ def test_smagorinsky_damps_an_underresolved_shear_layer():
     for _ in range(20):
         rest.step()
     assert float(np.abs(asnumpy(rest.u)).max()) < 1e-14
+
+
+def _pool(dtype, shift, n=(16, 10, 18)):
+    """A sloshing pool with gravity, Darcy damping and the sub-grid model."""
+    flag = np.full(n, GAS, np.int8)
+    flag[0] = flag[-1] = WALL
+    flag[:, 0] = flag[:, -1] = WALL
+    flag[:, :, 0] = flag[:, :, -1] = WALL
+    x = np.arange(n[0])[:, None, None]
+    z = np.arange(n[2])[None, None, :]
+    fill = np.clip(8 + 3 * np.cos(np.pi * x / (n[0] - 1)) + 0.5 - z, 0, 1) * np.ones(n)
+    inner = flag != WALL
+    flag = np.where(inner & (fill >= 1), LIQUID, np.where(inner & (fill > 0), INTERFACE, flag)).astype(np.int8)
+    s = FreeSurfaceLBM(flag, fill, tau=0.55, gravity=(0, 0, -3e-4), rho_gas=1.0002, dtype=dtype, shift=shift)
+    s.smagorinsky = 0.15
+    s.damping = 0.05
+    return s
+
+
+def test_shifted_populations_float32_conserve_mass():
+    """float32 with the populations stored whole loses ~1e-8 of the mass per step to rounding
+    (f ~ w_i, the physics in the 7th digit); stored as f - w_i (the float32 default) the drift
+    is orders of magnitude smaller. Defaults: shifted in float32, not in float64."""
+    assert _pool(np.float32, None).shifted and not _pool(np.float64, None).shifted
+    drift = {}
+    for shift in (False, True):
+        s = _pool(np.float32, shift)
+        m0 = s.total_mass()
+        for _ in range(300):
+            s.step()
+        drift[shift] = abs(s.total_mass() - m0) / m0
+    assert drift[True] < 1e-7                  # measured 2.2e-8 (unshifted: 8.1e-6)
+    assert drift[False] > 100 * drift[True]
+
+
+def test_shifted_populations_same_flow_in_float64():
+    """The shifted algebra is the same method: in float64 both storages give the same flow, and
+    switching the storage converts the populations (compared in the metal: gas and wall cells
+    hold scratch values the solver does not read)."""
+    a, b = _pool(np.float64, False), _pool(np.float64, True)
+    for _ in range(150):
+        a.step()
+        b.step()
+    assert np.abs(asnumpy(a.u) - asnumpy(b.u)).max() < 1e-12
+    assert np.array_equal(asnumpy(a.flag), asnumpy(b.flag))
+    assert abs(a.total_mass() - b.total_mass()) < 1e-10
+    fl = np.isin(asnumpy(a.flag), (LIQUID, INTERFACE))
+    assert np.abs(asnumpy(b.populations()) - asnumpy(a.f))[:, fl].max() < 1e-12
+    b.set_shift(False)
+    assert np.abs(asnumpy(b.f) - asnumpy(a.f))[:, fl].max() < 1e-12

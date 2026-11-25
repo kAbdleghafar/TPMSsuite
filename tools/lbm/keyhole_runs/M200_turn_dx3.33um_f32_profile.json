@@ -1,0 +1,18 @@
+{
+ "case": "M200_turn_dx3.33um_f32",
+ "ms_per_step": {
+  "lattice step": 51.512213006664446,
+  "surface terms": 23.880550299999566,
+  "bubbles": 4.827418326666096,
+  "ray tracer": 2.9071778599973186,
+  "heat": 1.42214949999925,
+  "solid/liquid coupling": 0.722984453339753,
+  "other": 1.77441350666642
+ },
+ "total_ms": 87.04690695333284,
+ "mlups": 50.48680250472399,
+ "steps": 300,
+ "cells": 4394720,
+ "dtype": "float32",
+ "kernel": "cuda"
+}

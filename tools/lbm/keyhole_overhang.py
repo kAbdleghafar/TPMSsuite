@@ -41,8 +41,9 @@ import tpmsfem as tf  # noqa: E402
 from tpmsfem.backend import asnumpy  # noqa: E402
 from tpmsfem.process import Evaporation, Laser, ScanVector  # noqa: E402
 from tpmsfem.process.freesurface import FreeSurfaceMeltPool  # noqa: E402
-from tpmsfem.process.keyhole import BubbleModel, RayTracer, keyhole_metrics, open_gas_reaches  # noqa: E402
+from tpmsfem.process.keyhole import BubbleModel, RayTracer, keyhole_metrics, melt_diagnostics, open_gas_reaches  # noqa: E402
 from tpmsfem.process.powder import rain_powder, voxelise  # noqa: E402
+from snapshots import Snapshots  # noqa: E402
 
 P, V, R0, ETA_M = 200.0, 0.75, 35e-6, 0.33
 EVAP = Evaporation(T_boil=2061.0, L_v=4.02e6, M=0.05494, p0=0.2 * 101325.0)     # Mn at 20 at% (gyroid study)
@@ -65,7 +66,8 @@ def build(a):
     fill[1:-1, 1:-1, nb + npw + 1:nb + npw + nsl + 1] = 1.0                   # the slab
     md = FreeSurfaceMeltPool(CM.material(), dx, fill, dt=a.dt or dx / 250.0, viscosity=MELT["viscosity"],
                              sigma=MELT["sigma"], mushy_C=1e9, T0=a.T0, T_max=9000.0, dsigma_dT=MELT["dsigma_dT"],
-                             evaporation=EVAP, recoil_factor=0.54, emissivity=0.4, energy_transport="lbm")
+                             evaporation=EVAP, recoil_factor=0.54, emissivity=0.4, energy_transport="lbm",
+                             dtype=np.dtype(a.dtype).type)
     md.rays = RayTracer(A0=ETA_M)
     md.ray_every = a.ray_every
     md.bubbles = BubbleModel(min_cells=2, open_sides=True)      # the powder's gas is open through the bed
@@ -99,12 +101,26 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--checkpoint", type=float, default=20.0)
     ap.add_argument("--redo", action="store_true", help="rerun a case that has already finished")
+    ap.add_argument("--dtype", default="float64", choices=["float64", "float32"],
+                    help="float32: several times faster on GeForce GPUs; results go to *_f32* files")
+    ap.add_argument("--profile", type=int, default=0, metavar="N",
+                    help="time N steps (after 30 warm-up steps), print where the time goes, and exit")
+    ap.add_argument("--snapshots", type=float, default=0.0, metavar="US",
+                    help="write the whole 3-D domain every US microseconds to <tag>_snap/ (0: off), for "
+                         "ParaView movies; about 10 MB per snapshot for a turn run")
     ap.add_argument("--backend", default=None)
     ap.add_argument("--out", default=os.path.join(HERE, "keyhole_runs"))
     a = ap.parse_args()
     md, path, laser, info = build(a)
     os.makedirs(a.out, exist_ok=True)
-    tag = f"overhang_slab{a.slab * 1e6:.0f}um_dx{a.dx * 1e6:g}um"
+    tag = f"overhang_slab{a.slab * 1e6:.0f}um_dx{a.dx * 1e6:g}um" + ("_f32" if a.dtype == "float32" else "")
+    info["dtype"] = a.dtype
+    if a.profile:
+        from lbm_profile import profile, report
+        r = profile(md, laser, path, a.profile)
+        report(r)
+        json.dump(dict(case=tag, **r), open(os.path.join(a.out, f"{tag}_profile.json"), "w"), indent=1)
+        return
     js, npz, ck = (os.path.join(a.out, f"{tag}{s}") for s in (".json", "_sections.npz", "_checkpoint.npz"))
     if not a.redo and not os.path.exists(ck) and os.path.exists(js) and json.load(open(js)).get("finished"):
         print(f"{tag}: already finished ({js}); --redo to run it again", flush=True)
@@ -113,11 +129,16 @@ def main():
     if os.path.exists(ck):
         md.load_state(ck)
         log = json.load(open(js)).get("log", []) if os.path.exists(js) else []
+        if os.path.exists(npz):                  # the sections saved before the interruption
+            z = np.load(npz)
+            sections = [(float(t), z["fill"][i], z["T"][i]) for i, t in enumerate(z["t"])]
         print(f"resumed at t = {md.t * 1e6:.1f} us", flush=True)
     dx = a.dx
     k_slab = int(round(info["z_slab_bottom"] / dx))          # first slab cell index
     jc = int(round(info["y"] / dx))
     every = max(1, int(round(1e-6 / md.dt)))
+    snaps = Snapshots(os.path.join(a.out, f"{tag}_snap"), a.snapshots * 1e-6, md.t)
+    info["snapshot_interval_us"] = a.snapshots or None
     last, t_wall = {}, [time.time(), time.time()]
 
     def save(finished=False):
@@ -140,15 +161,19 @@ def main():
         row["bubbles"] = [dict(volume_um3=x["volume"] * (dx * 1e6) ** 3, centroid_um=[c * dx * 1e6 for c in x["centroid"]],
                                frozen=x["frozen"], pore=x["pore"], pressure=x["pressure"]) for x in b.bubbles]
         row["formed"], row["released"] = b.formed, b.released
-        row.update(T_max=float(m.T.max()), limited=int(m.lbm.limited), recoil_clipped=int(m.recoil_clipped),
+        row.update(melt_diagnostics(m))          # T_max over metal; u_max of the pool, droplets apart
+        row.update(limited=int(m.lbm.limited), recoil_clipped=int(m.recoil_clipped),
                    mass=float(m.lbm.total_mass()), wall_s=time.time() - t_wall[0])
         log.append(row)
-        sections.append((t, asnumpy(m.lbm.fill[:, jc, :]).astype(np.float16), asnumpy(m.T[:, jc, :]).astype(np.float16)))
+        T_sec = np.where(asnumpy(m.metal()[:, jc, :]), asnumpy(m.T[:, jc, :]), np.nan)
+        sections.append((t, asnumpy(m.lbm.fill[:, jc, :]).astype(np.float16), T_sec.astype(np.float16)))
+        snaps(m, t)
         if len(log) % 10 == 0:
             print(f"t {t * 1e6:7.1f} us  depth {row.get('depth', float('nan')) * 1e6:6.1f} um  "
                   f"open below {row.get('open_below')} ({row.get('open_below_cells', 0)} cells)  "
                   f"bubbles {len(row['bubbles'])} (pores {sum(x['pore'] for x in row['bubbles'])})  "
-                  f"T_max {row['T_max']:6.0f} C  lim {row['limited']}  ({row['wall_s']:.0f} s)", flush=True)
+                  f"T_max {row['T_max']:6.0f} C  u_max {row['u_max']:5.1f} m/s  drops {row['drops']}  "
+                  f"lim {row['limited']}  ({row['wall_s']:.0f} s)", flush=True)
         if time.time() - t_wall[1] > 60.0 * a.checkpoint:
             md.save_state(ck)
             save()

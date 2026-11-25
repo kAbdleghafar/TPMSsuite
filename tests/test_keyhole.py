@@ -254,3 +254,106 @@ def test_open_sides_and_breakthrough():
     kh = _close(np.where(kh == INTERFACE, LIQUID, kh).astype(np.int8))
     reach, cells = open_gas_reaches(kh, 10)
     assert reach and cells > 50
+
+
+def test_melt_diagnostics_counts_metal_only_and_separates_droplets():
+    """T_max ignores stale temperatures of emptied cells; u_max is the pool's, a hot detached
+    droplet is reported apart and a cold detached particle (powder) is not a droplet."""
+    from types import SimpleNamespace
+
+    from tpmsfem.backend import to_device
+    from tpmsfem.process.keyhole import melt_diagnostics
+
+    n = 20
+    flag = np.full((n, n, n), GAS, np.int8)
+    flag[:, :, :6] = LIQUID                                   # plate with its pool
+    flag[:, :, 6] = INTERFACE
+    flag[4:6, 4:6, 12:14] = INTERFACE                         # hot droplet, detached
+    flag[14:16, 14:16, 12:14] = INTERFACE                     # cold particle, detached
+    fill = np.where(flag == LIQUID, 1.0, np.where(flag == INTERFACE, 0.8, 0.0))
+    T = np.full(flag.shape, 1000.0)
+    T[10, 10, 3] = 2500.0                                     # hottest metal
+    T[10, 10, 15] = 9000.0                                    # stale value in a gas cell
+    T[4:6, 4:6, 12:14] = 2000.0
+    u = np.zeros((3,) + flag.shape)
+    u[0, 8, 8, 4] = 0.1                                       # pool: 0.1 lattice -> 10 m/s
+    u[2, 4, 4, 12] = 0.3                                      # droplet: 30 m/s
+    u[1, 10, 10, 15] = 0.5                                    # gas cell (never counted)
+    md = SimpleNamespace(lbm=SimpleNamespace(flag=to_device(flag), fill=to_device(fill), u=to_device(u)),
+                         T=to_device(T), dx=1e-6, dt=1e-8, Ts=1600.0)
+    d = melt_diagnostics(md)
+    assert d["T_max"] == pytest.approx(2500.0)
+    assert d["u_max"] == pytest.approx(10.0)
+    assert d["drops"] == 1
+    assert d["u_max_drops"] == pytest.approx(30.0)
+    assert d["drop_volume_um3"] == pytest.approx(8 * 0.8)
+    assert d["u_max_all"] == pytest.approx(30.0)
+    assert d["u_max_all_at_um"] == pytest.approx([4.5, 4.5, 12.5])
+
+
+def test_float32_keyhole_conserves():
+    """The keyhole melt pool in float32 (the fast mode on GeForce GPUs, populations stored as
+    f - w): mass to 1e-7 (measured 5e-9; stored whole it was 1.3e-5), the energy balance closes
+    on the booked residual, and the keyhole deepens as in float64."""
+    import tpmsfem as tf
+    from tpmsfem.fem.materials import ThermalProperties
+    from tpmsfem.process import Evaporation, Laser, ScanVector
+    from tpmsfem.process.freesurface import FreeSurfaceMeltPool
+    from tpmsfem.process.keyhole import keyhole_metrics
+
+    th = ThermalProperties.from_si([0.0, 20000.0], [30.0, 30.0], [800.0, 800.0], 4000.0, 2.9e5, 1600.0, 1660.0)
+    mat = tf.Material("const", 110_000.0, 0.3, thermal=th)
+    h = 5e-6
+    depth = {}
+    for dt_ in (np.float64, np.float32):
+        metal = np.zeros((22, 18, 22), bool)
+        metal[1:-1, 1:-1, 1:13] = True
+        md = FreeSurfaceMeltPool(mat, h, metal, dt=h / 250, viscosity=3e-3, sigma=1.6, T0=25.0, T_max=8000.0,
+                                 dsigma_dT=-2.6e-4, evaporation=Evaporation(T_boil=3290.0, L_v=9.3e6, M=0.048),
+                                 energy_transport="lbm", dtype=dt_)
+        md.rays = RayTracer(A0=0.26)
+        md.ray_every = 5
+        md.lbm.smagorinsky = 0.15
+        res = md.run(Laser(300.0, 0.0, 25e-6), [ScanVector(h + 40e-6, 9 * h, h + 60e-6, 9 * h, 2.0)])
+        depth[dt_] = keyhole_metrics(md, h + 60e-6, 9 * h, 25e-6, 13 * h)["depth"]
+        assert abs(res.mass_error) < (1e-12 if dt_ is np.float64 else 1e-7)
+        assert abs(res.energy_balance + res.energy_residual) < (1e-9 if dt_ is np.float64 else 1e-6)
+    assert depth[np.float64] > 15e-6
+    assert depth[np.float32] == pytest.approx(depth[np.float64], abs=2e-6)
+
+
+def test_float32_checkpoint_restart(tmp_path):
+    """A float32 run (shifted populations) resumed from a checkpoint continues exactly; a
+    checkpoint written with the populations stored whole (older runs) is converted on loading."""
+    import tpmsfem as tf
+    from tpmsfem.fem.materials import ThermalProperties
+    from tpmsfem.process import Laser, ScanVector
+    from tpmsfem.process.freesurface import FreeSurfaceMeltPool
+
+    th = ThermalProperties.from_si([0.0, 20000.0], [30.0, 30.0], [800.0, 800.0], 4000.0, 2.9e5, 1600.0, 1660.0)
+    mat = tf.Material("const", 110_000.0, 0.3, thermal=th)
+    h = 5e-6
+
+    def make():
+        metal = np.zeros((18, 12, 18), bool)
+        metal[1:-1, 1:-1, 1:10] = True
+        return FreeSurfaceMeltPool(mat, h, metal, dt=h / 250, viscosity=3e-3, sigma=1.6, T0=25.0, dtype=np.float32)
+
+    path = [ScanVector(h + 20e-6, 6 * h, h + 50e-6, 6 * h, 2.0)]
+    laser = Laser(150.0, 0.3, 15e-6)
+    a = make()
+    assert a.lbm.shifted
+    a.run(laser, [ScanVector(path[0].x0, path[0].y0, path[0].x0 + 15e-6, path[0].y0, 2.0)])
+    a.save_state(tmp_path / "ck.npz")
+    b = make()
+    b.load_state(tmp_path / "ck.npz")
+    assert b.lbm.shifted and np.array_equal(np.asarray(a.lbm.f), np.asarray(b.lbm.f))
+    # the same checkpoint written the old way (populations stored whole) converts back
+    a.lbm.set_shift(False)
+    a.save_state(tmp_path / "old.npz")
+    c = make()
+    c.load_state(tmp_path / "old.npz")
+    a.lbm.set_shift(True)
+    assert c.lbm.shifted
+    assert np.abs(np.asarray(c.lbm.populations()) - np.asarray(b.lbm.populations())).max() < 1e-7
+    assert abs(c.lbm.total_mass() - b.lbm.total_mass()) < 1e-5 * b.lbm.total_mass()

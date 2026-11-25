@@ -56,8 +56,9 @@ from tpmsfem.backend import asnumpy  # noqa: E402
 from tpmsfem.process import Laser, ScanVector  # noqa: E402
 from tpmsfem.process.freesurface import FreeSurfaceMeltPool  # noqa: E402
 from tpmsfem.process import defects as DF  # noqa: E402
-from tpmsfem.process.keyhole import BubbleModel, RayTracer, keyhole_metrics  # noqa: E402
+from tpmsfem.process.keyhole import BubbleModel, RayTracer, keyhole_metrics, melt_diagnostics  # noqa: E402
 from tpmsfem.process.scanpath import ramp_down, turn_point  # noqa: E402
+from snapshots import Snapshots  # noqa: E402
 
 DATA = os.path.join(HERE, "..", "..", "benchmarks", "literature", "data", "gan2021_keyhole_xray.json")
 CASES = {"T1": (129.36, 0.4), "T2": (209.302, 1.1), "T3": (260.174, 0.6), "T4": (312.5, 0.9),
@@ -101,7 +102,10 @@ def build(args):
     T_dec = v / accel
     if turn:                                     # full speed, deceleration to the reversal, and back
         run_len = args.approach * v + 0.5 * v * T_dec
-        lx = args.lead + run_len + args.tail
+        back_len = 0.5 * v * T_dec + args.depart * v   # the return leg: acceleration, then full speed
+        # the domain holds both legs with ``lead`` clear of the wall at the start of the approach
+        # and at the end of the return (which is longer when depart > approach)
+        lx = args.lead + max(run_len, back_len) + args.tail
         e_exp = 2.0 * e_exp                      # the keyhole deepens in the turn
     else:
         lx = args.lead + args.track + args.tail
@@ -110,6 +114,8 @@ def build(args):
     if args.plate is None and turn:              # Martin et al.: 500 um plates; 400 um holds the turn keyhole
         args.plate = 400e-6
     plate = args.plate or max(250e-6, 1.5 * e_exp + 80e-6)
+    if args.gas is None:                         # melt piles up at the reversal: 50 um was reached at M200
+        args.gas = 150e-6 if turn else 50e-6
     ly = 2 * args.half_width + (args.hatch if turn else 0.0)
     n = (int(round(lx / dx)) + 2, int(round(ly / dx)) + 2, int(round((plate + args.gas) / dx)) + 2)
     npl = int(round(plate / dx))
@@ -119,7 +125,8 @@ def build(args):
     dt = args.dt or dx / 250.0
     md = FreeSurfaceMeltPool(TM.material(), dx, metal, dt=dt, viscosity=d["viscosity_Pa_s"], sigma=d["sigma_N_m"],
                              mushy_C=1e9, T0=25.0, T_max=9000.0, dsigma_dT=d["dsigma_dT"], evaporation=TM.evaporation(),
-                             recoil_factor=0.54, emissivity=d["emissivity"], energy_transport="lbm")
+                             recoil_factor=0.54, emissivity=d["emissivity"], energy_transport="lbm",
+                             dtype=np.dtype(args.dtype).type)
     md.rays = RayTracer(A0=d["eta_min"], k_over_n=args.k_over_n)
     md.ray_every = args.ray_every
     if not args.no_bubbles:
@@ -138,7 +145,8 @@ def build(args):
         extra.update(ramp=args.ramp)
     elif turn:
         y = dx + args.half_width                  # first track; the return track is a hatch higher
-        x_turn = x0 + run_len
+        x_turn = x0 + max(run_len, back_len)      # the return ends at x0 or later
+        x0 = x_turn - run_len
         power = None
         if scen == "turn-ke":
             Ke0, kw = ke_steady(P, v, r0)
@@ -148,13 +156,14 @@ def build(args):
         path, t_start = turn_point(x_turn, y, v, args.hatch, accel, approach=args.approach, depart=args.depart,
                                    dt_seg=args.seg_time, power=power)
         extra.update(accel=accel, hatch=args.hatch, x_turn=x_turn, t_turn=-t_start,
-                     approach=args.approach, depart=args.depart)
+                     approach=args.approach, depart=args.depart, y_return=y + args.hatch, x_start=x0,
+                     x_end=x_turn - back_len)
     else:
         raise ValueError(scen)
     z_surf = (npl + 1) * dx
     info = dict(case=args.case, scenario=scen, P=P, v=v, r0=r0, dx=dx, dt=dt, shape=list(n), plate=plate,
                 z_surface=z_surf, y=y, measured_depth=meas["e_m"] if meas else None,
-                measured_eta=meas["eta"] if meas else None, Ke=ke_steady(P, v, r0)[0], **extra)
+                measured_eta=meas["eta"] if meas else None, Ke=ke_steady(P, v, r0)[0], dtype=args.dtype, **extra)
     return md, path, Laser(P, 0.0, r0), info
 
 
@@ -178,7 +187,7 @@ def main():
     ap.add_argument("--tail", type=float, default=150e-6)
     ap.add_argument("--half-width", type=float, default=None, help="[m] default 150 um; 100 um for M cases")
     ap.add_argument("--plate", type=float, default=None)
-    ap.add_argument("--gas", type=float, default=50e-6)
+    ap.add_argument("--gas", type=float, default=None, help="[m] gas above the plate; default 50 um, 150 um for turns")
     ap.add_argument("--cool", type=float, default=100e-6, help="cooling time after the track [s]")
     ap.add_argument("--every", type=int, default=0, help="diagnostics every N steps (default: 1 us)")
     ap.add_argument("--ray-every", type=int, default=10)
@@ -189,6 +198,13 @@ def main():
     ap.add_argument("--no-bubbles", action="store_true")
     ap.add_argument("--checkpoint", type=float, default=20.0, help="minutes between checkpoints")
     ap.add_argument("--redo", action="store_true", help="rerun a case that has already finished")
+    ap.add_argument("--dtype", default="float64", choices=["float64", "float32"],
+                    help="float32: several times faster on GeForce GPUs; results go to *_f32* files")
+    ap.add_argument("--profile", type=int, default=0, metavar="N",
+                    help="time N steps (after 30 warm-up steps), print where the time goes, and exit")
+    ap.add_argument("--snapshots", type=float, default=0.0, metavar="US",
+                    help="write the whole 3-D domain every US microseconds to <tag>_snap/ (0: off), for "
+                         "ParaView movies; about 10 MB per snapshot for a turn run")
     ap.add_argument("--backend", default=None)
     ap.add_argument("--out", default=os.path.join(HERE, "keyhole_runs"))
     args = ap.parse_args()
@@ -196,29 +212,50 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     tag = (f"{args.case}_dx{args.dx * 1e6:g}um" if info["scenario"] == "track"
            else f"{args.case}_{info['scenario']}_dx{args.dx * 1e6:g}um")
+    if args.dtype == "float32":
+        tag += "_f32"
+    if args.profile:
+        from lbm_profile import profile, report
+        r = profile(md, laser, path, args.profile)
+        report(r)
+        json.dump(dict(case=tag, **r), open(os.path.join(args.out, f"{tag}_profile.json"), "w"), indent=1)
+        return
     js, npz, ck = (os.path.join(args.out, f"{tag}{s}") for s in (".json", "_sections.npz", "_checkpoint.npz"))
     if not args.redo and not os.path.exists(ck) and os.path.exists(js) and json.load(open(js)).get("finished"):
         print(f"{tag}: already finished ({js}); --redo to run it again", flush=True)
         return
     log, sections = [], []
+    if os.path.exists(ck) and os.path.exists(js):
+        old = json.load(open(js)).get("shape")
+        if old is not None and list(old) != list(info["shape"]):
+            sys.exit(f"{tag}: the checkpoint is for a {old} domain, this script now builds {info['shape']}. "
+                     f"Move {ck} away (or delete it) to start again with the new domain.")
     if os.path.exists(ck):
         md.load_state(ck)
         if os.path.exists(js):
             log = json.load(open(js)).get("log", [])
         if os.path.exists(npz):
             z = np.load(npz)
-            sections = [(float(t), z["fill"][i], z["T"][i]) for i, t in enumerate(z["t"])]
+            sections = [(float(t), z["fill"][i], z["T"][i]) + ((z["fill_return"][i], z["T_return"][i])
+                                                                  if "fill_return" in z.files else ())
+                        for i, t in enumerate(z["t"])]
         print(f"resumed at t = {md.t * 1e6:.1f} us", flush=True)
     every = args.every or max(1, int(round(1e-6 / info["dt"])))
+    snaps = Snapshots(os.path.join(args.out, f"{tag}_snap"), args.snapshots * 1e-6, md.t)
+    info["snapshot_interval_us"] = args.snapshots or None
     jc = int(round(info["y"] / info["dx"]))
+    jr = int(round(info["y_return"] / info["dx"])) if "y_return" in info else None   # turns: the return track
     t_wall = [time.time(), time.time()]
 
     def save():
         info.update(log=log, finished=False)
         json.dump(info, open(js, "w"), indent=1)
         if sections:
+            ret = {}
+            if all(len(s) == 5 for s in sections):
+                ret = dict(fill_return=np.stack([s[3] for s in sections]), T_return=np.stack([s[4] for s in sections]))
             np.savez_compressed(npz, t=np.array([s[0] for s in sections]),
-                                fill=np.stack([s[1] for s in sections]), T=np.stack([s[2] for s in sections]))
+                                fill=np.stack([s[1] for s in sections]), T=np.stack([s[2] for s in sections]), **ret)
 
     last = {}
 
@@ -238,17 +275,24 @@ def main():
                                    T_wall_max=b["T_wall_max"], frozen=b["frozen"], pore=b["pore"])
                               for b in m.bubbles.bubbles]
             row["bubbles_formed"], row["bubbles_released"] = m.bubbles.formed, m.bubbles.released
-        T = m.T
-        row.update(T_max=float(T.max()), u_max=float((m.lbm.u ** 2).sum(axis=0).max()) ** 0.5 * m.dx / m.dt,
-                   limited=int(m.lbm.limited), recoil_clipped=int(m.recoil_clipped),
+        row.update(melt_diagnostics(m))          # T_max over metal; u_max of the pool, droplets apart
+        row.update(limited=int(m.lbm.limited), recoil_clipped=int(m.recoil_clipped),
                    mass=float(m.lbm.total_mass()), wall_s=time.time() - t_wall[0])
         log.append(row)
-        sections.append((t, asnumpy(m.lbm.fill[:, jc, :]).astype(np.float16), asnumpy(T[:, jc, :]).astype(np.float16)))
+        # the section's temperature only where there is metal (emptied cells keep a stale T): NaN elsewhere
+        metal = m.metal()
+        sec = (t,)
+        for j in ((jc,) if jr is None else (jc, jr)):
+            T_sec = np.where(asnumpy(metal[:, j, :]), asnumpy(m.T[:, j, :]), np.nan)
+            sec += (asnumpy(m.lbm.fill[:, j, :]).astype(np.float16), T_sec.astype(np.float16))
+        sections.append(sec)
+        snaps(m, t)
         if len(log) % 10 == 0:
             d = row.get("depth", float("nan"))
             print(f"t {t * 1e6:7.1f} us  depth {d * 1e6:6.1f} um  absorbed {row.get('ray_absorbed', float('nan')):.2f}  "
                   f"bubbles {len(row.get('bubbles', []))} (pores {sum(b['pore'] for b in row.get('bubbles', []))})  "
                   f"T_max {row['T_max']:6.0f} C  u_max {row['u_max']:5.1f} m/s  "
+                  f"drops {row['drops']} (u {row['u_max_drops']:4.1f} m/s)  "
                   f"lim {row['limited']} clip {row['recoil_clipped']}  ({row['wall_s']:.0f} s)", flush=True)
         if time.time() - t_wall[1] > 60.0 * args.checkpoint:
             md.save_state(ck)
