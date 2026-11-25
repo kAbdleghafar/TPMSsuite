@@ -36,7 +36,7 @@ __global__ void fs_stream_collide(
     const REAL* __restrict__ Karr, const REAL Kconst, const REAL gx, const REAL gy, const REAL gz,
     const REAL wp, const REAL wm, const REAL u_limit, const int carry, const int has_solid,
     const int has_force, const int has_K, const signed char* __restrict__ itype,
-    const REAL tau0, const REAL magic, const REAL cs,
+    const REAL tau0, const REAL magic, const REAL cs, const int shifted,
     REAL* __restrict__ f_out, REAL* __restrict__ rho_out, REAL* __restrict__ u_out,
     REAL* __restrict__ mass_out, REAL* __restrict__ E_in, REAL* __restrict__ M_in, REAL* __restrict__ M_out,
     unsigned long long* limited, const int nx, const int ny, const int nz)
@@ -79,8 +79,14 @@ __global__ void fs_stream_collide(
             REAL wgt;
             if (sf == GAS) {
                 const REAL cu = CX[q] * ux0 + CY[q] * uy0 + CZ[q] * uz0;
-                fi = ((REAL)WD[q] * rg * ((REAL)1.0 + (REAL)3.0 * cu + (REAL)4.5 * cu * cu - (REAL)1.5 * usq0)
-                      + (REAL)WD[o] * rg * ((REAL)1.0 - (REAL)3.0 * cu + (REAL)4.5 * cu * cu - (REAL)1.5 * usq0) - fo);
+                if (shifted) {      // stored f - w: feq_q - w + feq_o - w - (f_o - w), w_q = w_o
+                    const REAL drg = rg - (REAL)1.0;
+                    fi = ((REAL)WD[q] * (drg + rg * ((REAL)3.0 * cu + (REAL)4.5 * cu * cu - (REAL)1.5 * usq0))
+                          + (REAL)WD[o] * (drg + rg * ((REAL)-3.0 * cu + (REAL)4.5 * cu * cu - (REAL)1.5 * usq0)) - fo);
+                } else {
+                    fi = ((REAL)WD[q] * rg * ((REAL)1.0 + (REAL)3.0 * cu + (REAL)4.5 * cu * cu - (REAL)1.5 * usq0)
+                          + (REAL)WD[o] * rg * ((REAL)1.0 - (REAL)3.0 * cu + (REAL)4.5 * cu * cu - (REAL)1.5 * usq0) - fo);
+                }
             }
             if (sf == LIQUID) {
                 wgt = 1.0;
@@ -108,11 +114,13 @@ __global__ void fs_stream_collide(
     }
     REAL rho = 0.0, jx = 0.0, jy = 0.0, jz = 0.0;
     for (int q = 0; q < 19; ++q) {
-        rho += fs[q];
+        rho += fs[q];          // shifted: the sum is drho = rho - 1, a small, well-resolved number
         jx += CX[q] * fs[q];
         jy += CY[q] * fs[q];
         jz += CZ[q] * fs[q];
     }
+    const REAL drho = rho;
+    if (shifted) rho = (REAL)1.0 + drho;
     REAL Fx = rho * gx + (has_force ? Fext[c] : (REAL)0.0);
     REAL Fy = rho * gy + (has_force ? Fext[N + c] : (REAL)0.0);
     REAL Fz = rho * gz + (has_force ? Fext[2 * N + c] : (REAL)0.0);
@@ -137,7 +145,10 @@ __global__ void fs_stream_collide(
     REAL feq[19];
     for (int q = 0; q < 19; ++q) {
         const REAL cu = CX[q] * ux + CY[q] * uy + CZ[q] * uz;
-        feq[q] = (REAL)WD[q] * rho * ((REAL)1.0 + (REAL)3.0 * cu + (REAL)4.5 * cu * cu - (REAL)1.5 * usq);
+        if (shifted)
+            feq[q] = (REAL)WD[q] * (drho + rho * ((REAL)3.0 * cu + (REAL)4.5 * cu * cu - (REAL)1.5 * usq));
+        else
+            feq[q] = (REAL)WD[q] * rho * ((REAL)1.0 + (REAL)3.0 * cu + (REAL)4.5 * cu * cu - (REAL)1.5 * usq);
     }
     REAL wpc = wp, wmc = wm;
     if (cs > (REAL)0.0) {
@@ -431,7 +442,7 @@ def stream_collide(lbm, flag, itype, rho_g, eps):
             R(Kc), R(g[0]), R(g[1]), R(g[2]), R(lbm.w_plus), R(lbm.w_minus), R(float(lbm.u_limit or 0.0)),
             np.int32(carry), np.int32(has_solid), np.int32(has_force), np.int32(has_K),
             cp.ascontiguousarray(itype, dtype=cp.int8), R(lbm.tau), R(lbm.magic), R(float(lbm.smagorinsky)),
-            f_out, rho, u, mass, E_in, M_in, M_out, lim, np.int32(sh[0]), np.int32(sh[1]), np.int32(sh[2]))
+            np.int32(bool(getattr(lbm, "shifted", False))), f_out, rho, u, mass, E_in, M_in, M_out, lim, np.int32(sh[0]), np.int32(sh[1]), np.int32(sh[2]))
     k(*_grid(N), args)
     if not carry:
         E_in = M_in = M_out = None

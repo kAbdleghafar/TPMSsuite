@@ -522,9 +522,24 @@ The study's settings are 85 µm hatch, one contour, 0.75 m/s.
   * the absorbed fraction is within 0.03;
   * the number of pores is the same;
   * mass is conserved to 1e-5 and the booked energy residual stays below 1 %.
-* **CPU check (small keyhole, 5 µm, 20 µs).** The depth follows float64 within 1–3 µm (49.6
-  against 48.6 µm at the end); mass error 4e-7 against 1e-13; booked energy residual 1.6 %
-  against 1.2 %. The GPU comparison of T3 decides.
+* **Speed (L4, M200, 4.4 M cells).** 87 ms per step in float32 against 187 ms in float64 (50
+  against 23 MLUPS): the lattice step 2.2× faster, the heat step 8×.
+* **First float32 batch: a mass drift, and its fix.** The turn and overhang runs on the L4
+  gained mass steadily, 2.6e-8 per step at every power (+0.44 % over a 2.3 ms turn run, against
+  1e-11 in float64). The cause is the storage of the populations: at rest f_i = w_i (1/3, 1/18,
+  1/36) and the physics is the deviation from it (1e-6 to 1e-3), which float32 resolves only
+  to ~3e-8 near 1/3; the rounding of every collision leans one way. The populations are now
+  stored as f_i − w_i in float32 (Lehmann et al., Phys. Rev. E 106, 015308, 2022): the same
+  method (streaming, bounce-back, the gas-side rebuild, the mass exchange and the collision are
+  unchanged in that form; the density is 1 + Σ f), with the full 7 digits on the physics.
+  float64 is unchanged. On a small keyhole on the CPU the drift drops from 2.8e-8 to 1e-11 per
+  step; the test keyhole's mass error from 1.3e-5 to 5e-9, its depth equal to float64's (24.9
+  µm). The CUDA kernel was checked against the CPU version (compiled as C++, one step agrees
+  to float32 rounding). Checkpoints record the storage, so older ones still load.
+* **Correction.** An earlier CPU check of float32 here (mass error 4e-7) was not a float32
+  test: the CPU array version mixed in float64 constants, which silently promoted most of the
+  arithmetic to float64. It now computes in the array's precision, and reproduces the GPU drift
+  when the populations are stored whole.
 
 ### 2. Collapse while scanning
 

@@ -292,8 +292,9 @@ def test_melt_diagnostics_counts_metal_only_and_separates_droplets():
 
 
 def test_float32_keyhole_conserves():
-    """The keyhole melt pool in float32 (the fast mode on GeForce GPUs): mass to 1e-5, the energy
-    balance closes on the booked residual, and the keyhole deepens as in float64."""
+    """The keyhole melt pool in float32 (the fast mode on GeForce GPUs, populations stored as
+    f - w): mass to 1e-7 (measured 5e-9; stored whole it was 1.3e-5), the energy balance closes
+    on the booked residual, and the keyhole deepens as in float64."""
     import tpmsfem as tf
     from tpmsfem.fem.materials import ThermalProperties
     from tpmsfem.process import Evaporation, Laser, ScanVector
@@ -315,7 +316,44 @@ def test_float32_keyhole_conserves():
         md.lbm.smagorinsky = 0.15
         res = md.run(Laser(300.0, 0.0, 25e-6), [ScanVector(h + 40e-6, 9 * h, h + 60e-6, 9 * h, 2.0)])
         depth[dt_] = keyhole_metrics(md, h + 60e-6, 9 * h, 25e-6, 13 * h)["depth"]
-        assert abs(res.mass_error) < (1e-12 if dt_ is np.float64 else 1e-5)
-        assert abs(res.energy_balance + res.energy_residual) < (1e-9 if dt_ is np.float64 else 1e-4)
+        assert abs(res.mass_error) < (1e-12 if dt_ is np.float64 else 1e-7)
+        assert abs(res.energy_balance + res.energy_residual) < (1e-9 if dt_ is np.float64 else 1e-6)
     assert depth[np.float64] > 15e-6
-    assert depth[np.float32] == pytest.approx(depth[np.float64], abs=5e-6)
+    assert depth[np.float32] == pytest.approx(depth[np.float64], abs=2e-6)
+
+
+def test_float32_checkpoint_restart(tmp_path):
+    """A float32 run (shifted populations) resumed from a checkpoint continues exactly; a
+    checkpoint written with the populations stored whole (older runs) is converted on loading."""
+    import tpmsfem as tf
+    from tpmsfem.fem.materials import ThermalProperties
+    from tpmsfem.process import Laser, ScanVector
+    from tpmsfem.process.freesurface import FreeSurfaceMeltPool
+
+    th = ThermalProperties.from_si([0.0, 20000.0], [30.0, 30.0], [800.0, 800.0], 4000.0, 2.9e5, 1600.0, 1660.0)
+    mat = tf.Material("const", 110_000.0, 0.3, thermal=th)
+    h = 5e-6
+
+    def make():
+        metal = np.zeros((18, 12, 18), bool)
+        metal[1:-1, 1:-1, 1:10] = True
+        return FreeSurfaceMeltPool(mat, h, metal, dt=h / 250, viscosity=3e-3, sigma=1.6, T0=25.0, dtype=np.float32)
+
+    path = [ScanVector(h + 20e-6, 6 * h, h + 50e-6, 6 * h, 2.0)]
+    laser = Laser(150.0, 0.3, 15e-6)
+    a = make()
+    assert a.lbm.shifted
+    a.run(laser, [ScanVector(path[0].x0, path[0].y0, path[0].x0 + 15e-6, path[0].y0, 2.0)])
+    a.save_state(tmp_path / "ck.npz")
+    b = make()
+    b.load_state(tmp_path / "ck.npz")
+    assert b.lbm.shifted and np.array_equal(np.asarray(a.lbm.f), np.asarray(b.lbm.f))
+    # the same checkpoint written the old way (populations stored whole) converts back
+    a.lbm.set_shift(False)
+    a.save_state(tmp_path / "old.npz")
+    c = make()
+    c.load_state(tmp_path / "old.npz")
+    a.lbm.set_shift(True)
+    assert c.lbm.shifted
+    assert np.abs(np.asarray(c.lbm.populations()) - np.asarray(b.lbm.populations())).max() < 1e-7
+    assert abs(c.lbm.total_mass() - b.lbm.total_mass()) < 1e-5 * b.lbm.total_mass()

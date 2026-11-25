@@ -69,9 +69,24 @@ class FreeSurfaceLBM:
     """
 
     def __init__(self, flag, fill=None, tau: float = 0.6, sigma: float = 0.0, gravity=(0.0, 0.0, 0.0),
-                 magic: float = 3.0 / 16.0, rho_gas: float = 1.0, dtype=np.float64, fill_offset: float = 1e-3):
+                 magic: float = 3.0 / 16.0, rho_gas: float = 1.0, dtype=np.float64, fill_offset: float = 1e-3,
+                 shift=None):
         self.xp = xp = get_xp()
         self.dtype = dtype
+        # The populations are stored as f_i - w_i ("shifted") when ``shift`` is True; default:
+        # in float32 only. At rest f_i = w_i (1/3, 1/18, 1/36) and the physics is the small
+        # deviation from it (1e-6 to 1e-3): stored whole, float32 resolves it to only ~3e-8
+        # (the spacing of floats near 1/3), and the rounding of every collision adds up to a
+        # mass drift; stored as the deviation, the full 7 digits describe the physics
+        # (Lehmann et al., Phys. Rev. E 106, 015308, 2022). Streaming, bounce-back, the
+        # gas-side rebuild, the mass exchange and the TRT collision are unchanged in shifted
+        # form (w_i = w_opp(i), and the collision uses differences only); the density is
+        # 1 + sum(f). float64 stays unshifted (bit-for-bit as before).
+        self.shifted = bool(np.dtype(dtype) == np.float32) if shift is None else bool(shift)
+        # constants as Python floats: NumPy keeps the array's precision with them (a float64
+        # scalar or int64 array element would silently promote float32 arithmetic to float64)
+        self._w = [float(v) for v in W]
+        self._c = [[float(v) for v in row] for row in C]
         flag = np.asarray(flag, dtype=np.int8)
         self.shape = flag.shape
         self.flag = xp.asarray(flag)
@@ -102,7 +117,7 @@ class FreeSurfaceLBM:
         # fused numba kernels on the CPU (float64), fused CUDA kernels on CuPy; "array" (the
         # generic whole-array version, NumPy or CuPy) is the reference
         if xp is np:
-            self.kernel = "numba" if (_k.available() and np.dtype(dtype) == np.float64) else "array"
+            self.kernel = "numba" if (_k.available() and np.dtype(dtype) == np.float64 and not self.shifted) else "array"
         else:
             self.kernel = "cuda" if np.dtype(dtype) in (np.float64, np.float32) else "array"
         self.limited = 0               # most cells limited in one step
@@ -145,19 +160,46 @@ class FreeSurfaceLBM:
     def nu(self):
         return (self.tau - 0.5) / 3.0
 
-    def _feq(self, rho, u):
+    def _feq_i(self, i, rho, u, drho=None, usq=None):
+        """Equilibrium population i as stored (minus w_i when shifted; ``drho`` = rho - 1,
+        computed from rho when not given)."""
+        c, w = self._c[i], self._w[i]
+        cu = c[0] * u[0] + c[1] * u[1] + c[2] * u[2]
+        if usq is None:
+            usq = u[0] * u[0] + u[1] * u[1] + u[2] * u[2]
+        if self.shifted:
+            d = rho - 1.0 if drho is None else drho
+            return w * (d + rho * (3.0 * cu + 4.5 * cu * cu - 1.5 * usq))
+        return w * rho * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * usq)
+
+    def _feq(self, rho, u, drho=None):
+        """All equilibrium populations as stored (see ``shifted``)."""
         xp = self.xp
         usq = u[0] * u[0] + u[1] * u[1] + u[2] * u[2]
         f = xp.empty((Q,) + self.shape, dtype=self.dtype)
         for i in range(Q):
-            cu = C[i, 0] * u[0] + C[i, 1] * u[1] + C[i, 2] * u[2]
-            f[i] = W[i] * rho * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * usq)
+            f[i] = self._feq_i(i, rho, u, drho, usq)
         return f
 
-    def _feq_i(self, i, rho, u):
-        cu = C[i, 0] * u[0] + C[i, 1] * u[1] + C[i, 2] * u[2]
-        usq = u[0] * u[0] + u[1] * u[1] + u[2] * u[2]
-        return W[i] * rho * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * usq)
+    def populations(self):
+        """The populations f_i themselves (float64), whatever the storage."""
+        f = self.f.astype(np.float64)
+        if self.shifted:
+            f = f + self.xp.asarray(W, dtype=np.float64)[:, None, None, None]
+        return f
+
+    def set_shift(self, on):
+        """Switch the storage of the populations (shifted: f_i - w_i), converting them."""
+        on = bool(on)
+        if on == self.shifted:
+            return
+        f = self.populations() if self.shifted else self.f.astype(np.float64)
+        if on:
+            f = f - self.xp.asarray(W, dtype=np.float64)[:, None, None, None]
+            if self.kernel == "numba":
+                self.kernel = "array"
+        self.f = f.astype(self.dtype)
+        self.shifted = on
 
     @property
     def fill(self):
@@ -166,9 +208,20 @@ class FreeSurfaceLBM:
         return xp.clip(eps, 0.0, 1.0)
 
     def total_mass(self):
+        """Metal mass in lattice units (interface cells: their mass; liquid cells: their density),
+        summed in float64. With shifted populations a liquid cell's density is taken as
+        1 + sum(f_i) from the populations themselves: ``rho`` (and ``mass``) hold 1 + drho
+        rounded to the storage precision, which in float32 hides changes below ~6e-8."""
         xp = self.xp
-        fluid = (self.flag == LIQUID) | (self.flag == INTERFACE)
-        return float(xp.sum(xp.where(fluid, self.mass, 0.0))) + self.lost_mass
+        itf = self.flag == INTERFACE
+        liq = self.flag == LIQUID
+        m = float(xp.sum(xp.where(itf, self.mass, 0.0), dtype=np.float64))
+        if self.shifted:
+            d = self.f.sum(axis=0, dtype=np.float64)
+            m += float(xp.sum(liq)) + float(xp.sum(xp.where(liq, d, 0.0)))
+        else:
+            m += float(xp.sum(xp.where(liq, self.mass, 0.0), dtype=np.float64))
+        return m + self.lost_mass
 
     # ------------------------------------------------------------------ curvature
     def _shift_mirror(self, a, ax, d, wall):
@@ -337,7 +390,7 @@ class FreeSurfaceLBM:
                 ex_itf = ex
             # rebuild what comes from the gas, and (Koerner 2005) everything arriving from the
             # gas side of the interface, so the gas pressure acts evenly on a staircase surface
-            cn = C[i, 0] * nrm[0] + C[i, 1] * nrm[1] + C[i, 2] * nrm[2]
+            cn = self._c[i][0] * nrm[0] + self._c[i][1] * nrm[1] + self._c[i][2] * nrm[2]
             rebuild = itf & ((src == GAS) | ((cn > 0.0) & (src != WALL) & self.rebuild_normal))
             if bool(rebuild.any()):
                 rec = self._feq_i(i, rho_g, u) + self._feq_i(o, rho_g, u) - f[o]
@@ -358,13 +411,21 @@ class FreeSurfaceLBM:
                 M_out -= xp.minimum(J, 0.0)
         self.mass = xp.where(itf, self.mass + dm, self.mass)
         # macroscopic fields
-        rho = fs.sum(axis=0)
-        rho = xp.where(fluid, rho, 1.0)
+        if self.shifted:
+            drho = fs[0].copy()
+            for i in range(1, Q):
+                drho += fs[i]
+            drho = xp.where(fluid, drho, 0.0)
+            rho = 1.0 + drho
+        else:
+            rho = fs.sum(axis=0)
+            rho = xp.where(fluid, rho, 1.0)
+            drho = None
         j = xp.stack([sum(float(C[i, a]) * fs[i] for i in range(Q) if C[i, a] != 0) for a in range(3)])
         F = xp.zeros((3,) + self.shape, dtype=self.dtype)
         for a in range(3):
             if self.g[a] != 0.0:
-                F[a] = rho * self.g[a]
+                F[a] = rho * float(self.g[a])
         if self.force is not None:
             F = F + self.force
         K = self.damping if self.damping is not None else 0.0
@@ -381,7 +442,7 @@ class FreeSurfaceLBM:
         u = xp.where(fluid, u, 0.0)
         F = xp.where(fluid, F, 0.0)
         # TRT collision with Guo forcing
-        feq = self._feq(rho, u)
+        feq = self._feq(rho, u, drho)
         wp, wm = self.w_plus, self.w_minus
         if self.smagorinsky > 0.0:
             # non-equilibrium momentum flux, its norm, and the cell's relaxation rates
@@ -392,7 +453,7 @@ class FreeSurfaceLBM:
                     P[a, b] = sum(float(C[i, a] * C[i, b]) * neq[i] for i in range(Q) if C[i, a] * C[i, b] != 0)
             Pn = xp.sqrt(P[0, 0] ** 2 + P[1, 1] ** 2 + P[2, 2] ** 2 + 2.0 * (P[0, 1] ** 2 + P[0, 2] ** 2 + P[1, 2] ** 2))
             t0 = self.tau
-            te = 0.5 * (t0 + xp.sqrt(t0 * t0 + 18.0 * np.sqrt(2.0) * self.smagorinsky ** 2 * Pn / rho))
+            te = 0.5 * (t0 + xp.sqrt(t0 * t0 + float(18.0 * np.sqrt(2.0)) * self.smagorinsky ** 2 * Pn / rho))
             wp = 1.0 / te
             wm = 1.0 / (self.magic / (te - 0.5) + 0.5)
         uF = u[0] * F[0] + u[1] * F[1] + u[2] * F[2]
@@ -401,10 +462,11 @@ class FreeSurfaceLBM:
             o = OPP[i]
             fp, fm = 0.5 * (fs[i] + fs[o]), 0.5 * (fs[i] - fs[o])
             ep, em = 0.5 * (feq[i] + feq[o]), 0.5 * (feq[i] - feq[o])
-            cF = C[i, 0] * F[0] + C[i, 1] * F[1] + C[i, 2] * F[2]
-            cu = C[i, 0] * u[0] + C[i, 1] * u[1] + C[i, 2] * u[2]
-            Sp = W[i] * (9.0 * cu * cF - 3.0 * uF)
-            Sm = W[i] * 3.0 * cF
+            c, w = self._c[i], self._w[i]
+            cF = c[0] * F[0] + c[1] * F[1] + c[2] * F[2]
+            cu = c[0] * u[0] + c[1] * u[1] + c[2] * u[2]
+            Sp = w * (9.0 * cu * cF - 3.0 * uF)
+            Sm = w * 3.0 * cF
             out[i] = fs[i] - wp * (fp - ep) - wm * (fm - em) + (1.0 - 0.5 * wp) * Sp + (1.0 - 0.5 * wm) * Sm
         self.f = xp.where(fluid[None], out, fs)
         self.rho, self.u = rho, u
@@ -513,8 +575,7 @@ class FreeSurfaceLBM:
         uu = [u[a][idx] for a in range(3)]
         usq = uu[0] ** 2 + uu[1] ** 2 + uu[2] ** 2
         for i in range(Q):
-            cu = C[i, 0] * uu[0] + C[i, 1] * uu[1] + C[i, 2] * uu[2]
-            self.f[i][idx] = W[i] * r * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * usq)
+            self.f[i][idx] = self._feq_i(i, r, uu, None, usq)
 
     def _mix(self, mask, m_before, m_in, E_in, m_out, extra_true=None):
         """Update the carried value h of the cells in ``mask``: mass ``m_in`` arrives carrying
@@ -1032,7 +1093,7 @@ class FreeSurfaceMeltPool:
         arr = {f"lbm_{k}": asnumpy(getattr(self.lbm, k)) for k in self._STATE_LBM}
         arr.update(H=asnumpy(self.H), T=asnumpy(self.T))
         meta = dict(t=self.t, lost=self.lost, lbm_steps=self.lbm.steps, lbm_lost_mass=self.lbm.lost_mass,
-                    recoil_clipped=self.recoil_clipped, limited=self.lbm.limited)
+                    recoil_clipped=self.recoil_clipped, limited=self.lbm.limited, f_shifted=self.lbm.shifted)
         bub = None
         if self.bubbles is not None:
             b = self.bubbles
@@ -1049,6 +1110,10 @@ class FreeSurfaceMeltPool:
             setattr(self.lbm, k, xp.asarray(d[f"lbm_{k}"]))
         self.H, self.T = xp.asarray(d["H"]), xp.asarray(d["T"])
         m = pickle.loads(d["meta"].tobytes())
+        # populations stored as f or as f - w (checkpoints before the shifted storage: f)
+        want = self.lbm.shifted
+        self.lbm.shifted = bool(m["meta"].get("f_shifted", False))
+        self.lbm.set_shift(want)
         self.t, self.lost = m["meta"]["t"], m["meta"]["lost"]
         self.lbm.steps, self.lbm.lost_mass = m["meta"]["lbm_steps"], m["meta"]["lbm_lost_mass"]
         self.recoil_clipped, self.lbm.limited = m["meta"]["recoil_clipped"], m["meta"]["limited"]
