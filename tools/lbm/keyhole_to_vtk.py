@@ -4,7 +4,9 @@ files for ParaView. No extra dependencies: VTK XML ImageData with raw appended d
 Writes, next to the run (or to ``--out``):
   <tag>_vtk/section_0000.vti ...   the centreline x-z section every saved step (``fill`` = metal
                                     fill level, ``T`` [degC]; field data ``time_us``,
-                                    ``laser_on``, ``x_laser_um``, ``depth_um``, ``y_plane_um``)
+                                    ``laser_on``, ``x_laser_um``, ``depth_um``, ``y_plane_um``,
+                                    ``grid_um``, ``closed_pockets`` (closed gas pockets in the
+                                    metal), ``pores`` (of those, frozen after being molten))
   <tag>_section.pvd                 the time series of those sections (open this one)
   <tag>_section_return.pvd          turn-point runs: the same on the return track
   <tag>_3d.pvd                      runs made with --snapshots: the whole domain every few us
@@ -107,11 +109,15 @@ def _zlib_block(raw, level=6, block=1 << 20):
     return head.tobytes() + b"".join(parts)
 
 
-def write_vti(path, point_data, origin, spacing, field_data=None, compress=False):
+def write_vti(path, point_data, origin, spacing, field_data=None, compress=False, base64=False):
     """VTK XML ImageData with point data (one point per solver cell, at the cell centre: ``origin``
     is the centre of the first cell), raw appended binary (UInt64 headers). Arrays are (nx, ny, nz);
     an extent of 1 in z gives a 2-D image, which ParaView shows face-on as a coloured slice.
-    ``compress``: zlib-compressed blocks (for the large 3-D snapshots)."""
+    ``compress``: zlib-compressed blocks (for the large 3-D snapshots). ``base64``: the arrays
+    inline as base64 text (format="binary") instead of raw appended bytes: a third larger and
+    slower to write, but read by every ParaView, including builds whose VTK (before 9.3) uses
+    the system XML parser expat 2.6 or newer (Ubuntu 24.04's ParaView 5.11), which fail on
+    raw appended data in files over 4 kB."""
     shape = next(iter(point_data.values())).shape
     nx, ny, nz = shape
     vtk_types = {np.dtype(np.float32): "Float32", np.dtype(np.float64): "Float64", np.dtype(np.int8): "Int8",
@@ -123,9 +129,18 @@ def write_vti(path, point_data, origin, spacing, field_data=None, compress=False
         a = np.ascontiguousarray(a)
         raw = a.tobytes()
         b = _zlib_block(raw) if compress else np.uint64(len(raw)).tobytes() + raw
+        head = f'<{tag} type="{vtk_types[a.dtype]}" Name="{name}" NumberOfComponents="{ncomp}" NumberOfTuples="{a.size // ncomp}"'
+        if base64:
+            import base64 as b64
+            if compress:        # the header and the compressed blocks are encoded separately
+                nh = 8 * (3 + int(np.frombuffer(b[:8], np.uint64)[0]))
+                text = b64.b64encode(b[:nh]) + b64.b64encode(b[nh:])
+            else:
+                text = b64.b64encode(b)
+            arrays_xml.append(f'{head} format="binary">' + text.decode() + f'</{tag}>')
+            return
         blocks.append(b)
-        arrays_xml.append(f'<{tag} type="{vtk_types[a.dtype]}" Name="{name}" NumberOfComponents="{ncomp}" '
-                          f'NumberOfTuples="{a.size // ncomp}" format="appended" offset="{offset}"/>')
+        arrays_xml.append(f'{head} format="appended" offset="{offset}"/>')
         offset += len(b)
 
     field_xml = ""
@@ -145,9 +160,12 @@ def write_vti(path, point_data, origin, spacing, field_data=None, compress=False
             f'header_type="UInt64"{' compressor="vtkZLibDataCompressor"' if compress else ''}>\n<ImageData WholeExtent="{ext}" Origin="{origin[0]} {origin[1]} {origin[2]}" '
             f'Spacing="{spacing} {spacing} {spacing}">\n{field_xml}\n<Piece Extent="{ext}">\n'
             f'<PointData Scalars="{next(iter(point_data))}">{cells_xml}</PointData>\n</Piece>\n</ImageData>\n'
-            f'<AppendedData encoding="raw">\n_')
+            + ('' if base64 else '<AppendedData encoding="raw">\n_'))
     with open(path, "wb") as f:
         f.write(head.encode())
+        if base64:
+            f.write(b"</VTKFile>\n")
+            return
         for b in blocks:
             f.write(b)
         f.write(b"\n</AppendedData>\n</VTKFile>\n")
@@ -159,6 +177,10 @@ def main():
     ap.add_argument("--out", default=None, help="output folder (default: next to the run)")
     ap.add_argument("--every", type=int, default=1, help="write every N-th saved section")
     ap.add_argument("--snap-every", type=int, default=1, help="export every N-th 3-D snapshot")
+    ap.add_argument("--base64", action="store_true",
+                    help="arrays as inline base64 text instead of raw appended bytes: for ParaView builds "
+                         "that report 'not well-formed (invalid token)' (VTK < 9.3 with expat >= 2.6, e.g. "
+                         "Ubuntu 24.04's ParaView 5.11)")
     ap.add_argument("--parts", default="sections,final,3d",
                     help="what to export, comma separated: sections, final, 3d (default: all there is)")
     ap.add_argument("--xz", action="store_true",
@@ -182,8 +204,10 @@ def main():
         # logs without ``laser_on`` (older runs): on while the laser position is logged
         on = r.get("laser_on", r.get("x_l") is not None) if r else False
         x_l = r.get("x_l") if r.get("x_l") is not None else r.get("x_last")   # x_last: after turn-off
+        bub = r.get("bubbles", []) if r else []
         return dict(time_us=t * 1e6, laser_on=float(bool(on)), x_laser_um=x_l * 1e6 if x_l is not None else np.nan,
-                    depth_um=r["depth"] * 1e6 if r.get("depth") is not None else np.nan)
+                    depth_um=r["depth"] * 1e6 if r.get("depth") is not None else np.nan, grid_um=dx,
+                    closed_pockets=float(len(bub)), pores=float(sum(1 for b in bub if b.get("pore"))))
 
     if "sections" in parts and os.path.exists(base + "_sections.npz"):
         with np.load(base + "_sections.npz") as zs:  # decompress each array once, not per frame
@@ -206,7 +230,8 @@ def main():
                 else:         # (nx, nz, 1): VTK x = x, VTK y = height z, a flat image
                     arr, org = (lambda v: v[:, :, None]), (0.5 * dx, z0 + 0.5 * dx, 0.0)
                 write_vti(os.path.join(d, fn), dict(fill=arr(open_walls(s[kf][n])),
-                                                    T=arr(s[kT][n]).astype(np.float32)), org, dx, fd)
+                                                    T=arr(s[kT][n]).astype(np.float32)), org, dx, fd,
+                          base64=a.base64)
                 entries.append(f'<DataSet timestep="{t * 1e6:.4f}" part="0" file="{tag}_vtk/{fn}"/>')
             pvd = os.path.join(out, f"{tag}_section{suffix}.pvd")
             with open(pvd, "w") as f:
@@ -230,7 +255,7 @@ def main():
                 fn = f"snap_{os.path.basename(fsnap)[5:-4]}.vti"
                 write_vti(os.path.join(d, fn), dict(fill=open_walls(z["fill"]), T=extend_into_gas(z["T"]),
                                                     flag=z["flag"].astype(np.int8)),
-                          (0.5 * dx, 0.5 * dx, z0 + 0.5 * dx), dx, fd, compress=True)
+                          (0.5 * dx, 0.5 * dx, z0 + 0.5 * dx), dx, fd, compress=True, base64=a.base64)
             entries.append(f'<DataSet timestep="{t * 1e6:.4f}" part="0" file="{tag}_vtk/{fn}"/>')
             print(f"\r3-D snapshot {n + 1}/{len(files)}", end="", flush=True)
         if entries:
@@ -245,7 +270,7 @@ def main():
         fin = os.path.join(out, f"{tag}_final.vti")
         write_vti(fin, dict(fill=open_walls(z["fill"]), flag=z["flag"].astype(np.int8),
                             T_peak=z["T_peak"].astype(np.float32)), (0.5 * dx, 0.5 * dx, z0 + 0.5 * dx), dx,
-                  dict(time_us=log[-1]["t"] * 1e6 if log else np.nan))
+                  dict(time_us=log[-1]["t"] * 1e6 if log else np.nan), base64=a.base64)
         written.append(fin)
     for w in written:
         print("wrote", w)

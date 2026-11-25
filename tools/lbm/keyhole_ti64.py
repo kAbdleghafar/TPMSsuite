@@ -59,6 +59,7 @@ from tpmsfem.process import defects as DF  # noqa: E402
 from tpmsfem.process.keyhole import BubbleModel, RayTracer, keyhole_metrics, melt_diagnostics  # noqa: E402
 from tpmsfem.process.scanpath import ramp_down, turn_point  # noqa: E402
 from snapshots import Snapshots  # noqa: E402
+from tpmsfem.process.powder import rain_powder, voxelise  # noqa: E402
 
 DATA = os.path.join(HERE, "..", "..", "benchmarks", "literature", "data", "gan2021_keyhole_xray.json")
 CASES = {"T1": (129.36, 0.4), "T2": (209.302, 1.1), "T3": (260.174, 0.6), "T4": (312.5, 0.9),
@@ -117,10 +118,15 @@ def build(args):
     if args.gas is None:                         # melt piles up at the reversal: 50 um was reached at M200
         args.gas = 150e-6 if turn else 50e-6
     ly = 2 * args.half_width + (args.hatch if turn else 0.0)
-    n = (int(round(lx / dx)) + 2, int(round(ly / dx)) + 2, int(round((plate + args.gas) / dx)) + 2)
+    layer = args.powder_layer or 0.0
+    n = (int(round(lx / dx)) + 2, int(round(ly / dx)) + 2, int(round((plate + layer + args.gas) / dx)) + 2)
     npl = int(round(plate / dx))
-    metal = np.zeros(n, bool)
-    metal[1:-1, 1:-1, 1:npl + 1] = True
+    metal = np.zeros(n)
+    metal[1:-1, 1:-1, 1:npl + 1] = 1.0
+    bed = None
+    if layer > 0.0:                              # a powder layer on the plate (Ti-6Al-4V, 15-45 um)
+        bed = rain_powder((dx, dx + lx, dx, dx + ly), (npl + 1) * dx, layer, seed=args.seed)
+        metal = np.maximum(metal, voxelise(bed, dx, n))
     d = TM.GAN2021
     dt = args.dt or dx / 250.0
     md = FreeSurfaceMeltPool(TM.material(), dx, metal, dt=dt, viscosity=d["viscosity_Pa_s"], sigma=d["sigma_N_m"],
@@ -130,7 +136,7 @@ def build(args):
     md.rays = RayTracer(A0=d["eta_min"], k_over_n=args.k_over_n)
     md.ray_every = args.ray_every
     if not args.no_bubbles:
-        md.bubbles = BubbleModel(gamma=1.0)
+        md.bubbles = BubbleModel(gamma=1.0, open_sides=bed is not None)   # powder: its gas is open at the sides
         md.bubble_every = args.bubble_every
     if args.recoil_cap is not None:
         md.recoil_cap = args.recoil_cap
@@ -164,6 +170,9 @@ def build(args):
     info = dict(case=args.case, scenario=scen, P=P, v=v, r0=r0, dx=dx, dt=dt, shape=list(n), plate=plate,
                 z_surface=z_surf, y=y, measured_depth=meas["e_m"] if meas else None,
                 measured_eta=meas["eta"] if meas else None, Ke=ke_steady(P, v, r0)[0], dtype=args.dtype, **extra)
+    if bed is not None:                          # depths stay measured from the plate surface
+        info.update(powder_layer=layer, particles=int(len(bed.radii)), powder_packing=float(bed.packing_density),
+                    seed=args.seed)
     return md, path, Laser(P, 0.0, r0), info
 
 
@@ -187,6 +196,9 @@ def main():
     ap.add_argument("--tail", type=float, default=150e-6)
     ap.add_argument("--half-width", type=float, default=None, help="[m] default 150 um; 100 um for M cases")
     ap.add_argument("--plate", type=float, default=None)
+    ap.add_argument("--powder-layer", type=float, default=0.0, metavar="M",
+                    help="a powder layer of this thickness [m] on the plate (0: bare plate)")
+    ap.add_argument("--seed", type=int, default=1, help="random seed of the powder layer")
     ap.add_argument("--gas", type=float, default=None, help="[m] gas above the plate; default 50 um, 150 um for turns")
     ap.add_argument("--cool", type=float, default=100e-6, help="cooling time after the track [s]")
     ap.add_argument("--every", type=int, default=0, help="diagnostics every N steps (default: 1 us)")
@@ -212,6 +224,8 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     tag = (f"{args.case}_dx{args.dx * 1e6:g}um" if info["scenario"] == "track"
            else f"{args.case}_{info['scenario']}_dx{args.dx * 1e6:g}um")
+    if args.powder_layer:
+        tag += f"_powder{args.powder_layer * 1e6:g}um"
     if args.dtype == "float32":
         tag += "_f32"
     if args.profile:

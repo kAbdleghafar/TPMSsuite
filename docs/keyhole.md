@@ -406,7 +406,9 @@ The study's settings are 85 µm hatch, one contour, 0.75 m/s.
   * Results: `tools/lbm/keyhole_runs/T3_dx3.33um*` and `T3_ramp_dx3.33um*`.
   * Figure: `tools/lbm/keyhole_figure.py closure --out docs/img/keyhole_closure_gpu.png --times 0,10,30,100 <runs>`.
   * ParaView: `tools/lbm/keyhole_to_vtk.py <run>.json` writes the centreline sections as a time series and the 3-D end state.
-  * 3-D movies: run with `--snapshots 10` (the GPU batch does by default; `SNAP=0` turns it off) to save the whole domain every 10 µs. `keyhole_to_vtk.py <run>.json --parts 3d` writes `<tag>_3d.pvd` (compressed). `pvpython tools/lbm/paraview_keyhole_3d.py <tag>_3d.pvd --movie <tag>.avi` cuts the domain along the track, keeps the metal and colours it by temperature. It also runs from the ParaView GUI: View > Python Shell > Run Script.
+  * 3-D movies: run with `--snapshots 10` (the GPU batch does by default; `SNAP=0` turns it off) to save the whole domain every 10 µs. `keyhole_to_vtk.py <run>.json --parts 3d` writes `<tag>_3d.pvd` (compressed). `pvpython tools/lbm/paraview_keyhole_3d.py <tag>_3d.pvd --movie <tag>.avi` cuts the domain along the track, keeps the metal (plate, powder, melt) and colours it by temperature in kelvin (300–4000 K, Cool to Warm, white background), with the text "Grid … Time … N closed gas pockets (hollows)". `--view side` (default) looks square on at the cut face with the laser moving left to right; `--view oblique` from above in perspective; `--frame N` writes one frame. Without a display: `xvfb-run -a pvpython …`. It also runs from the ParaView GUI: View > Python Shell > Run Script.
+  * A powder layer on the plate: `keyhole_ti64.py … --powder-layer 40e-6 [--seed N]` (Ti-6Al-4V powder, 15–45 µm; results go to `*_powder40um*`; depths stay measured from the plate surface).
+  * If ParaView reports "not well-formed (invalid token)" on opening the files, export with `--base64`. Builds whose VTK is older than 9.3 but use the system XML parser expat 2.6 or newer (Ubuntu 24.04's ParaView 5.11) cannot read raw appended data in files over 4 kB, their own included; base64 is a third larger and read by every version.
 
 ![closure on the GPU](img/keyhole_closure_gpu.png)
 
@@ -540,6 +542,52 @@ The study's settings are 85 µm hatch, one contour, 0.75 m/s.
   test: the CPU array version mixed in float64 constants, which silently promoted most of the
   arithmetic to float64. It now computes in the array's precision, and reproduces the GPU drift
   when the populations are stored whole.
+
+### Keyhole oscillations and pinch-offs
+
+`tools/lbm/keyhole_spectrum.py RUN.json ... --out docs/img/keyhole_spectrum.png` (the
+function: `tpmsfem.process.keyhole.depth_spectrum`).
+
+* **What it measures.** The spectrum of the keyhole depth (logged every 1 µs) and how many gas
+  pockets pinch off, per window:
+  * **steady:** the beam at full speed, second half of that stretch;
+  * **turn:** the beam below 90 % of full speed (deceleration, reversal, acceleration). The
+    keyhole deepens and recovers over ~1.5 ms there, so the fluctuations about a 100 µs
+    Gaussian running mean are analysed (slow trend removed; above ~3 kHz kept).
+* **Pinch-offs.** Gas pockets followed from one log entry to the next by their centroids. A
+  pinch-off is a pocket of at least 10 µm, living at least 5 µs, whose walls reached the
+  solidus. (`bubbles_formed` in the logs counts every closed gas region the labelling saw,
+  one-cell specks and powder voids included, and is not a pinch-off count.)
+* **Resolution.** 1 / window length: 4–7 kHz for the steady windows of these runs. Resolving
+  the 1–10 kHz band X-ray studies report needs millisecond-long tracks.
+
+| run | window | t [µs] | Δf [kHz] | mean depth [µm] | rms [µm] | peak [kHz] | 1–10 kHz | 10–50 kHz | > 50 kHz | pinch-offs (lived ≥ 50 µs) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| T3 | steady | 250–499 | 4.0 | 140 | 4 | 8 | 0.37 | 0.35 | 0.28 | 0 (0) |
+| M100 turn | steady | 1955–2099 | 6.9 | 29 | 4 | 48 | 0.03 | 0.23 | 0.74 | 0 (0) |
+| M100 turn | turn | 191–1810 | 0.6 | 103 | 22 | 31 | 0.02 | 0.39 | 0.59 | 17 (1) |
+| M200 turn | steady | 1955–2099 | 6.9 | 106 | 6 | 124 | 0.40 | 0.11 | 0.49 | 1 (1) |
+| M200 turn | turn | 191–1810 | 0.6 | 273 | 58 | 11 | 0.08 | 0.55 | 0.36 | 36 (3) |
+| M300 turn | steady | 1955–2099 | 6.9 | 160 | 11 | 21 | 0.25 | 0.35 | 0.40 | 1 (1) |
+| M300 turn | turn | 191–1810 | 0.6 | 399 | 74 | 9 | 0.15 | 0.50 | 0.34 | 25 (3) |
+| M200, constant Ke | steady | 1955–2099 | 6.9 | 108 | 6 | 14 | 0.51 | 0.20 | 0.29 | 0 (0) |
+| M200, constant Ke | turn | 191–1810 | 0.6 | 135 | 18 | 52 | 0.06 | 0.22 | 0.71 | 13 (1) |
+| overhang, 150 µm slab | steady | 200–399 | 5.0 | 109 | 2 | 15 | 0.14 | 0.63 | 0.23 | 0 (0) |
+
+![keyhole spectra](img/keyhole_spectrum.png)
+
+* **Reading.**
+  * At full speed the keyholes are stable: rms 2–11 µm, the power spread from a few kHz
+    upward, no pinch-offs (one in M200 and M300, which still carry the turn's melt).
+  * Through the turn the deep M200 and M300 keyholes oscillate by 58–74 µm rms with peaks at
+    9–11 kHz, the upper end of the range X-ray studies report for unstable keyholes, and
+    25–36 pockets pinch off; 3 of them live 50 µs or more.
+  * The constant-Ke power schedule cuts the fluctuation to 18 µm rms and the pinch-offs to 13.
+  * The power above 50 kHz is largely the depth metric itself (one-cell steps of 3.33 µm,
+    sampled every 1 µs), not physics.
+* **Caveats.** The turn runs are the first float32 batch (before the wall and mass-drift
+  fixes; see above) at r₀/7.5 resolution. The numbers are a first look, to be redone with
+  the rerun batch.
 
 ### 2. Collapse while scanning
 

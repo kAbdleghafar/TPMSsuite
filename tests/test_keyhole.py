@@ -357,3 +357,26 @@ def test_float32_checkpoint_restart(tmp_path):
     assert c.lbm.shifted
     assert np.abs(np.asarray(c.lbm.populations()) - np.asarray(b.lbm.populations())).max() < 1e-7
     assert abs(c.lbm.total_mass() - b.lbm.total_mass()) < 1e-5 * b.lbm.total_mass()
+
+
+def test_depth_spectrum_finds_the_oscillation():
+    """A 7 kHz depth oscillation on a slow deepening: found with and without the running mean,
+    the band shares add up, and the PSD integrates to the variance (Parseval)."""
+    from tpmsfem.process.keyhole import depth_spectrum
+
+    t = np.arange(0.0, 1.5e-3, 1e-6)
+    rng = np.random.default_rng(0)
+    d = 100e-6 + 5e-6 * np.sin(2 * np.pi * 7e3 * t) + 0.5e-6 * rng.normal(size=t.size)
+    s = depth_spectrum(t, d)
+    assert s["f_peak"] == pytest.approx(7e3, abs=s["df"])
+    assert s["band_fraction"]["1-10kHz"] > 0.85
+    assert sum(s["band_fraction"].values()) == pytest.approx(1.0, abs=1e-9)
+    assert np.sum(s["psd"][1:]) * (s["f"][1] - s["f"][0]) == pytest.approx(s["rms"] ** 2, rel=0.05)
+    assert s["mean"] == pytest.approx(100e-6, rel=1e-2)        # 10.5 periods: not a whole number
+    # a keyhole deepening and recovering over the window (as through a turn)
+    bell = 50e-6 * np.exp(-0.5 * ((t - 0.75e-3) / 0.4e-3) ** 2)
+    raw = depth_spectrum(t, d + bell)
+    assert raw["band_fraction"]["<1kHz"] > 0.5                 # the trend dominates the raw spectrum
+    s2 = depth_spectrum(t, d + bell, smooth=100e-6, f_min=2e3)
+    assert s2["f_peak"] == pytest.approx(7e3, abs=s2["df"])
+    assert s2["band_fraction"]["<1kHz"] < 0.15                 # measured 0.06 (raw: 0.75)

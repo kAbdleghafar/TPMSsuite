@@ -573,3 +573,71 @@ def open_gas_reaches(flag, k_below):
     below = top[lab[:, :, 1:k_below]]
     cnt = int(below.sum())
     return cnt > 0, cnt
+
+
+def depth_spectrum(t, depth, t0=None, t1=None, segment=None, f_min=None, smooth=None):
+    """Power spectrum of keyhole-depth oscillations (Welch: linear detrend, Hann window, half
+    overlap) over the window ``t0 <= t <= t1`` [s].
+
+    The depth series is resampled to its median time step first. ``segment``: Welch segment
+    length [s] (default: the whole window, i.e. the finest frequency resolution 1/T at the cost
+    of a noisier estimate). Returns a dict with ``f`` [Hz], ``psd`` [m^2/Hz], the window length
+    ``T`` and resolution ``df`` [Hz], the mean depth and the rms (std) of its fluctuations [m], the dominant frequency
+    ``f_peak`` [Hz] (largest PSD above ``f_min``, default 2/T: slower trends are not
+    oscillations), and the fraction of the fluctuation power in the bands below 1 kHz, 1-10 kHz,
+    10-50 kHz and above 50 kHz.
+
+    The frequency resolution is 1/T: a 250 us window resolves 4 kHz, so a spectrum in the
+    1-10 kHz range X-ray studies report needs tracks of a millisecond or more.
+
+    ``smooth`` [s]: for a non-stationary window (a keyhole deepening and recovering through a
+    turn), the fluctuations about a Gaussian running mean of this width (sigma) are analysed
+    instead of the depth itself. With 100 us the slow trend (below ~1 kHz) is removed, 3 kHz
+    keeps 83 % of its amplitude and 5 kHz all of it."""
+    t = np.asarray(t, float)
+    d = np.asarray(depth, float)
+    m = np.isfinite(d) & np.isfinite(t)
+    if t0 is not None:
+        m &= t >= t0
+    if t1 is not None:
+        m &= t <= t1
+    t, d = t[m], d[m]
+    if t.size < 16:
+        raise ValueError("fewer than 16 samples in the window")
+    h = float(np.median(np.diff(t)))
+    tu = np.arange(t[0], t[-1] + 0.5 * h, h)
+    du = np.interp(tu, t, d)
+    mean = float(du.mean())
+    if smooth:
+        k = np.arange(-int(4 * smooth / h), int(4 * smooth / h) + 1) * h
+        g = np.exp(-0.5 * (k / smooth) ** 2)
+        num = np.convolve(du, g, mode="same")
+        den = np.convolve(np.ones_like(du), g, mode="same")
+        du = du - num / den
+    T = tu[-1] - tu[0] + h
+    n = tu.size
+    L = n if segment is None else max(16, min(n, int(round(segment / h))))
+    step = max(1, L // 2)
+    win = np.hanning(L)
+    scale = 1.0 / (np.sum(win ** 2) / h)              # one-sided PSD in m^2/Hz
+    acc, k = 0.0, 0
+    for s in range(0, n - L + 1, step):
+        seg = du[s:s + L]
+        x = np.arange(L)
+        seg = seg - np.polyval(np.polyfit(x, seg, 1), x)
+        acc = acc + np.abs(np.fft.rfft(seg * win)) ** 2
+        k += 1
+    psd = acc / k * scale
+    psd[1:-1] *= 2.0
+    f = np.fft.rfftfreq(L, h)
+    lo = 2.0 / T if f_min is None else f_min
+    sel = f >= lo
+    f_peak = float(f[sel][np.argmax(psd[sel])]) if sel.any() else float("nan")
+    df = f[1] - f[0]
+    total = float(np.sum(psd[1:]) * df)
+    bands = {}
+    for name, (a, b) in {"<1kHz": (0, 1e3), "1-10kHz": (1e3, 1e4), "10-50kHz": (1e4, 5e4), ">50kHz": (5e4, np.inf)}.items():
+        bm = (f > 0) & (f >= a) & (f < b)
+        bands[name] = float(np.sum(psd[bm]) * df / total) if total > 0 else float("nan")
+    return dict(f=f, psd=psd, T=T, df=float(1.0 / T), dt=h, mean=mean, rms=float(du.std()),
+                f_peak=f_peak, band_fraction=bands, n=n, segments=k)
