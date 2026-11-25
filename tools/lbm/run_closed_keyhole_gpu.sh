@@ -10,6 +10,12 @@
 #   PYTHON=.venv/Scripts/python bash tools/lbm/run_closed_keyhole_gpu.sh   # a specific interpreter
 #   bash tools/lbm/run_closed_keyhole_gpu.sh precision                     # is float32 good enough?
 #   DTYPE=float32 bash tools/lbm/run_closed_keyhole_gpu.sh turn overhang   # then the rest in float32
+#   SNAP=0 bash tools/lbm/run_closed_keyhole_gpu.sh                         # no 3-D snapshots
+#
+# 3-D snapshots for ParaView movies: every SNAP us (default 10; about 2-3 GB per turn run, 0.2 GB
+# per overhang run) in keyhole_runs/<tag>_snap/. Then:
+#   python tools/lbm/keyhole_to_vtk.py tools/lbm/keyhole_runs/<tag>.json --parts 3d
+#   pvpython tools/lbm/paraview_keyhole_3d.py tools/lbm/keyhole_runs/<tag>_3d.pvd --movie <tag>.avi
 #
 # Groups:
 #   off      Ti-6Al-4V T3 track, laser off abruptly at the end vs ramped down over 100 um
@@ -25,23 +31,24 @@ export TPMSFEM_BACKEND=cupy
 DX=${DX:-3.33e-6}
 CKPT=${CKPT:-10}
 DTYPE=${DTYPE:-float64}
+SNAP=${SNAP:-10}
 PY=${PYTHON:-python}
 SETS=("$@")
 [ ${#SETS[@]} -eq 0 ] && SETS=(off turn overhang)
 for g in "${SETS[@]}"; do
   case "$g" in
     off)
-      "$PY" tools/lbm/keyhole_ti64.py T3 --dx "$DX" --track 300e-6 --cool 200e-6 --checkpoint "$CKPT" --dtype "$DTYPE"
-      "$PY" tools/lbm/keyhole_ti64.py T3 --dx "$DX" --track 300e-6 --cool 200e-6 --scenario ramp --ramp 100e-6 --checkpoint "$CKPT" --dtype "$DTYPE"
+      "$PY" tools/lbm/keyhole_ti64.py T3 --dx "$DX" --track 300e-6 --cool 200e-6 --checkpoint "$CKPT" --dtype "$DTYPE" --snapshots "$SNAP"
+      "$PY" tools/lbm/keyhole_ti64.py T3 --dx "$DX" --track 300e-6 --cool 200e-6 --scenario ramp --ramp 100e-6 --checkpoint "$CKPT" --dtype "$DTYPE" --snapshots "$SNAP"
       ;;
     turn)
       # 700 um plates: at 400 um the M200 keyhole reached the bottom wall 88 us after the turn
-      "$PY" tools/lbm/keyhole_ti64.py M200 --dx "$DX" --scenario turn --plate 700e-6 --cool 200e-6 --checkpoint "$CKPT" --dtype "$DTYPE"
-      "$PY" tools/lbm/keyhole_ti64.py M200 --dx "$DX" --scenario turn-ke --plate 700e-6 --cool 200e-6 --checkpoint "$CKPT" --dtype "$DTYPE"
-      for c in M100 M300; do "$PY" tools/lbm/keyhole_ti64.py "$c" --dx "$DX" --scenario turn --plate 700e-6 --cool 200e-6 --checkpoint "$CKPT" --dtype "$DTYPE"; done
+      "$PY" tools/lbm/keyhole_ti64.py M200 --dx "$DX" --scenario turn --plate 700e-6 --cool 200e-6 --checkpoint "$CKPT" --dtype "$DTYPE" --snapshots "$SNAP"
+      "$PY" tools/lbm/keyhole_ti64.py M200 --dx "$DX" --scenario turn-ke --plate 700e-6 --cool 200e-6 --checkpoint "$CKPT" --dtype "$DTYPE" --snapshots "$SNAP"
+      for c in M100 M300; do "$PY" tools/lbm/keyhole_ti64.py "$c" --dx "$DX" --scenario turn --plate 700e-6 --cool 200e-6 --checkpoint "$CKPT" --dtype "$DTYPE" --snapshots "$SNAP"; done
       ;;
     overhang)
-      for t in 90e-6 150e-6 250e-6; do "$PY" tools/lbm/keyhole_overhang.py --slab "$t" --dx "$DX" --checkpoint "$CKPT" --dtype "$DTYPE"; done
+      for t in 90e-6 150e-6 250e-6; do "$PY" tools/lbm/keyhole_overhang.py --slab "$t" --dx "$DX" --checkpoint "$CKPT" --dtype "$DTYPE" --snapshots "$SNAP"; done
       ;;
     precision)
       for d in float64 float32; do

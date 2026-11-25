@@ -406,6 +406,7 @@ The study's settings are 85 µm hatch, one contour, 0.75 m/s.
   * Results: `tools/lbm/keyhole_runs/T3_dx3.33um*` and `T3_ramp_dx3.33um*`.
   * Figure: `tools/lbm/keyhole_figure.py closure --out docs/img/keyhole_closure_gpu.png --times 0,10,30,100 <runs>`.
   * ParaView: `tools/lbm/keyhole_to_vtk.py <run>.json` writes the centreline sections as a time series and the 3-D end state.
+  * 3-D movies: run with `--snapshots 10` (the GPU batch does by default; `SNAP=0` turns it off) to save the whole domain every 10 µs. `keyhole_to_vtk.py <run>.json --parts 3d` writes `<tag>_3d.pvd` (compressed). `pvpython tools/lbm/paraview_keyhole_3d.py <tag>_3d.pvd --movie <tag>.avi` cuts the domain along the track, keeps the metal and colours it by temperature. It also runs from the ParaView GUI: View > Python Shell > Run Script.
 
 ![closure on the GPU](img/keyhole_closure_gpu.png)
 

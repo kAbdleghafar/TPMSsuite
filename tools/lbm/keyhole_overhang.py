@@ -43,6 +43,7 @@ from tpmsfem.process import Evaporation, Laser, ScanVector  # noqa: E402
 from tpmsfem.process.freesurface import FreeSurfaceMeltPool  # noqa: E402
 from tpmsfem.process.keyhole import BubbleModel, RayTracer, keyhole_metrics, melt_diagnostics, open_gas_reaches  # noqa: E402
 from tpmsfem.process.powder import rain_powder, voxelise  # noqa: E402
+from snapshots import Snapshots  # noqa: E402
 
 P, V, R0, ETA_M = 200.0, 0.75, 35e-6, 0.33
 EVAP = Evaporation(T_boil=2061.0, L_v=4.02e6, M=0.05494, p0=0.2 * 101325.0)     # Mn at 20 at% (gyroid study)
@@ -104,6 +105,9 @@ def main():
                     help="float32: several times faster on GeForce GPUs; results go to *_f32* files")
     ap.add_argument("--profile", type=int, default=0, metavar="N",
                     help="time N steps (after 30 warm-up steps), print where the time goes, and exit")
+    ap.add_argument("--snapshots", type=float, default=0.0, metavar="US",
+                    help="write the whole 3-D domain every US microseconds to <tag>_snap/ (0: off), for "
+                         "ParaView movies; about 10 MB per snapshot for a turn run")
     ap.add_argument("--backend", default=None)
     ap.add_argument("--out", default=os.path.join(HERE, "keyhole_runs"))
     a = ap.parse_args()
@@ -125,11 +129,16 @@ def main():
     if os.path.exists(ck):
         md.load_state(ck)
         log = json.load(open(js)).get("log", []) if os.path.exists(js) else []
+        if os.path.exists(npz):                  # the sections saved before the interruption
+            z = np.load(npz)
+            sections = [(float(t), z["fill"][i], z["T"][i]) for i, t in enumerate(z["t"])]
         print(f"resumed at t = {md.t * 1e6:.1f} us", flush=True)
     dx = a.dx
     k_slab = int(round(info["z_slab_bottom"] / dx))          # first slab cell index
     jc = int(round(info["y"] / dx))
     every = max(1, int(round(1e-6 / md.dt)))
+    snaps = Snapshots(os.path.join(a.out, f"{tag}_snap"), a.snapshots * 1e-6, md.t)
+    info["snapshot_interval_us"] = a.snapshots or None
     last, t_wall = {}, [time.time(), time.time()]
 
     def save(finished=False):
@@ -158,6 +167,7 @@ def main():
         log.append(row)
         T_sec = np.where(asnumpy(m.metal()[:, jc, :]), asnumpy(m.T[:, jc, :]), np.nan)
         sections.append((t, asnumpy(m.lbm.fill[:, jc, :]).astype(np.float16), T_sec.astype(np.float16)))
+        snaps(m, t)
         if len(log) % 10 == 0:
             print(f"t {t * 1e6:7.1f} us  depth {row.get('depth', float('nan')) * 1e6:6.1f} um  "
                   f"open below {row.get('open_below')} ({row.get('open_below_cells', 0)} cells)  "

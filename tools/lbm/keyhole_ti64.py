@@ -58,6 +58,7 @@ from tpmsfem.process.freesurface import FreeSurfaceMeltPool  # noqa: E402
 from tpmsfem.process import defects as DF  # noqa: E402
 from tpmsfem.process.keyhole import BubbleModel, RayTracer, keyhole_metrics, melt_diagnostics  # noqa: E402
 from tpmsfem.process.scanpath import ramp_down, turn_point  # noqa: E402
+from snapshots import Snapshots  # noqa: E402
 
 DATA = os.path.join(HERE, "..", "..", "benchmarks", "literature", "data", "gan2021_keyhole_xray.json")
 CASES = {"T1": (129.36, 0.4), "T2": (209.302, 1.1), "T3": (260.174, 0.6), "T4": (312.5, 0.9),
@@ -201,6 +202,9 @@ def main():
                     help="float32: several times faster on GeForce GPUs; results go to *_f32* files")
     ap.add_argument("--profile", type=int, default=0, metavar="N",
                     help="time N steps (after 30 warm-up steps), print where the time goes, and exit")
+    ap.add_argument("--snapshots", type=float, default=0.0, metavar="US",
+                    help="write the whole 3-D domain every US microseconds to <tag>_snap/ (0: off), for "
+                         "ParaView movies; about 10 MB per snapshot for a turn run")
     ap.add_argument("--backend", default=None)
     ap.add_argument("--out", default=os.path.join(HERE, "keyhole_runs"))
     args = ap.parse_args()
@@ -237,6 +241,8 @@ def main():
                         for i, t in enumerate(z["t"])]
         print(f"resumed at t = {md.t * 1e6:.1f} us", flush=True)
     every = args.every or max(1, int(round(1e-6 / info["dt"])))
+    snaps = Snapshots(os.path.join(args.out, f"{tag}_snap"), args.snapshots * 1e-6, md.t)
+    info["snapshot_interval_us"] = args.snapshots or None
     jc = int(round(info["y"] / info["dx"]))
     jr = int(round(info["y_return"] / info["dx"])) if "y_return" in info else None   # turns: the return track
     t_wall = [time.time(), time.time()]
@@ -280,6 +286,7 @@ def main():
             T_sec = np.where(asnumpy(metal[:, j, :]), asnumpy(m.T[:, j, :]), np.nan)
             sec += (asnumpy(m.lbm.fill[:, j, :]).astype(np.float16), T_sec.astype(np.float16))
         sections.append(sec)
+        snaps(m, t)
         if len(log) % 10 == 0:
             d = row.get("depth", float("nan"))
             print(f"t {t * 1e6:7.1f} us  depth {d * 1e6:6.1f} um  absorbed {row.get('ray_absorbed', float('nan')):.2f}  "
