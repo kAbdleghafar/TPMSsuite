@@ -8,6 +8,9 @@ Needs a run made with ``--snapshots US`` and exported with keyhole_to_vtk.py (wh
         pvpython tools/lbm/paraview_keyhole_3d.py path/to/<tag>_3d.pvd --movie keyhole.avi
     (.avi or .ogv; a .png name writes numbered frames). On a machine without a display:
         xvfb-run -a pvpython tools/lbm/paraview_keyhole_3d.py ... --movie keyhole.avi
+    An MP4 (plays everywhere, small) from numbered frames:
+        pvpython tools/lbm/paraview_keyhole_3d.py <tag>_3d.pvd --movie frames/f.png
+        ffmpeg -framerate 12 -pattern_type glob -i "frames/f*.png" -vf "scale=1200:-2,format=yuv420p" -c:v libx264 keyhole.mp4
   * pvpython, interactive window:   pvpython tools/lbm/paraview_keyhole_3d.py path/to/<tag>_3d.pvd
   * ParaView GUI: View > Python Shell > Run Script, pick this file (set PVD below first).
 
@@ -21,7 +24,8 @@ Options:
   --frame N        write only frame N as a .png (with --movie name.png): a quick check
 
 Pipeline: the half of the domain from the track centreline outward (so the cut face is on the
-track), the metal only (clip by ``fill`` at 0.5), temperature in kelvin (``T`` + 273.15),
+track), the metal only (clip at 0.5 by ``surface``, the fill smoothed once, or ``fill`` in older
+exports), its outer surface with smoothed normals, temperature in kelvin (``T`` + 273.15),
 "Cool to Warm" colours from 300 to 4000 K, white background, and the text
 "Grid: .. um   Time: .. microseconds / N closed gas pockets (hollows)".
 """
@@ -29,9 +33,9 @@ import glob
 import os
 import sys
 
-from paraview.simple import (Calculator, Clip, ColorBy, ExtractSubset, GetActiveViewOrCreate, GetAnimationScene,
-                             GetColorTransferFunction, GetScalarBar, PVDReader, PythonAnnotation, Render,
-                             SaveAnimation, SaveScreenshot, Show, servermanager)
+from paraview.simple import (Calculator, Clip, ColorBy, ExtractSubset, ExtractSurface, GenerateSurfaceNormals,
+                             GetActiveViewOrCreate, GetAnimationScene, GetColorTransferFunction, GetScalarBar,
+                             PVDReader, PythonAnnotation, Render, SaveAnimation, SaveScreenshot, Show, servermanager)
 
 PVD = None          # e.g. r"C:\runs\T3_dx2.5um_powder40um_f32_3d.pvd"
 T_RANGE_K = (300.0, 4000.0)
@@ -68,20 +72,24 @@ def build(pvd, view_kind="side", plane="track", title=None, size=None):
     # increasing to the right
     half = ExtractSubset(Input=reader)
     half.VOI = [e[0], e[1], j, e[3], e[4], e[5]]
+    clip_by = "surface" if img.GetPointData().GetArray("surface") else "fill"   # smoothed fill if exported
     metal = Clip(Input=half)
     metal.ClipType = "Scalar"
-    metal.Scalars = ["POINTS", "fill"]
+    metal.Scalars = ["POINTS", clip_by]
     metal.Value = 0.5
     _try(metal, "Invert", 0)
     # which side a scalar clip keeps has changed between ParaView versions: keep the metal side
     metal.UpdatePipeline(t0)
     out = servermanager.Fetch(metal)
-    arr = out.GetPointData().GetArray("fill") if out is not None else None
+    arr = out.GetPointData().GetArray(clip_by) if out is not None else None
     if arr is not None and arr.GetNumberOfTuples() > 0:
         idx = range(0, arr.GetNumberOfTuples(), max(1, arr.GetNumberOfTuples() // 997))
         if sum(arr.GetValue(i) for i in idx) / len(idx) < 0.5:
             _try(metal, "Invert", 1)
-    kelvin = Calculator(Input=metal)
+    # a surface with consistent, smoothed normals: no dark facets on the clipped walls
+    skin = GenerateSurfaceNormals(Input=ExtractSurface(Input=metal))
+    _try(skin, "Splitting", 0)
+    kelvin = Calculator(Input=skin)
     _try(kelvin, "AttributeType", "Point Data")
     kelvin.ResultArrayName = "Temperature (K)"
     kelvin.Function = "T+273.15"
@@ -104,7 +112,10 @@ def build(pvd, view_kind="side", plane="track", title=None, size=None):
     bar.Title = "Temperature (K)"
     bar.ComponentTitle = ""
     _try(bar, "Orientation", "Horizontal")
-    _try(bar, "WindowLocation", "Lower Right Corner", "LowerRightCorner")
+    _try(bar, "WindowLocation", "Lower Center", "LowerCenter")
+    _try(bar, "ScalarBarLength", 0.5)
+    for p in ("TitleFontSize", "LabelFontSize"):
+        _try(bar, p, 18)
     for p in ("TitleColor", "LabelColor"):
         _try(bar, p, [0.0, 0.0, 0.0])
     _try(bar, "RangeLabelFormat", "%-#6.1e")
@@ -117,7 +128,7 @@ def build(pvd, view_kind="side", plane="track", title=None, size=None):
     label.Expression = ("%r + '\\nGrid: %g um    Time: %%.0f microseconds\\n%%d closed gas pockets (hollows)' "
                         "%% (t_value, int(closed_pockets[0]) if 'closed_pockets' in dir() else 0)") % (head, grid)
     lab = Show(label, view)
-    lab.FontSize = 14
+    lab.FontSize = 20
     _try(lab, "Color", [0.0, 0.0, 0.0])
     _try(lab, "Justification", "Left")
     _try(lab, "WindowLocation", "Upper Left Corner", "UpperLeftCorner")

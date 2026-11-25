@@ -10,7 +10,8 @@ Writes, next to the run (or to ``--out``):
   <tag>_section.pvd                 the time series of those sections (open this one)
   <tag>_section_return.pvd          turn-point runs: the same on the return track
   <tag>_3d.pvd                      runs made with --snapshots: the whole domain every few us
-                                    (``fill``, ``T``, ``flag``; zlib-compressed files
+                                    (``fill``, ``surface`` = fill smoothed once for
+                                    the clip, ``T``, ``flag``; zlib-compressed files
                                     <tag>_vtk/snap_*.vti). For the cut view of a movie run
                                     tools/lbm/paraview_keyhole_3d.py in ParaView.
   <tag>_final.vti                   the 3-D state at the end of the run (``fill``, ``flag``
@@ -97,6 +98,19 @@ def extend_into_gas(T, layers=2):
                 n += ok
         T = np.where(bad & (n > 0), s / np.maximum(n, 1), T)
     return T
+
+
+def smooth_fill(fill, passes=1):
+    """The fill level smoothed with a [1 2 1] filter along each axis (``passes`` times), for a
+    smooth clip surface in the 3-D views (the fill itself jumps from 0 to 1 within a cell or
+    two, which renders as a staircase)."""
+    f = np.array(fill, dtype=np.float32)
+    for _ in range(passes):
+        for ax in range(3):
+            P = np.pad(f, [(1, 1) if a == ax else (0, 0) for a in range(3)], mode="edge")
+            sl = lambda o: tuple(slice(1 + o, P.shape[a] - 1 + o) if a == ax else slice(None) for a in range(3))  # noqa: E731
+            f = 0.25 * P[sl(-1)] + 0.5 * P[sl(0)] + 0.25 * P[sl(1)]
+    return f
 
 
 def _zlib_block(raw, level=6, block=1 << 20):
@@ -253,7 +267,8 @@ def main():
                 t = float(z["t"])
                 fd = dict(fields(t), **extra)
                 fn = f"snap_{os.path.basename(fsnap)[5:-4]}.vti"
-                write_vti(os.path.join(d, fn), dict(fill=open_walls(z["fill"]), T=extend_into_gas(z["T"]),
+                fill = open_walls(z["fill"])
+                write_vti(os.path.join(d, fn), dict(fill=fill, surface=smooth_fill(fill), T=extend_into_gas(z["T"]),
                                                     flag=z["flag"].astype(np.int8)),
                           (0.5 * dx, 0.5 * dx, z0 + 0.5 * dx), dx, fd, compress=True, base64=a.base64)
             entries.append(f'<DataSet timestep="{t * 1e6:.4f}" part="0" file="{tag}_vtk/{fn}"/>')
