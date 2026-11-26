@@ -543,6 +543,34 @@ The study's settings are 85 µm hatch, one contour, 0.75 m/s.
   arithmetic to float64. It now computes in the array's precision, and reproduces the GPU drift
   when the populations are stored whole.
 
+### Active window: the flow only around the melt
+
+`--window` on `keyhole_ti64.py` and `keyhole_overhang.py` (`WINDOW=1` in the GPU batch;
+`FreeSurfaceMeltPool.window = True`).
+
+* **What it does.** The surface terms, the solid/liquid coupling and the lattice step run in a
+  box around the hot metal (within 150 °C of the solidus) and the beam spot (1.5 radii), from
+  6 cells below the deepest hot cell to the top of the domain, plus 6 cells of margin. The
+  heat step, the ray tracer, the bubbles and the surface losses still cover the whole domain.
+  Outside the box the metal is solid (Darcy-damped: it does not move in the full model either)
+  and the gas is empty. With nothing hot and the laser off the flow step is skipped.
+* **Why it pays.** On the L4 a float32 M200 step is 87 ms: 76 ms of it is the flow part (the
+  fused lattice kernel is only ~3 ms; the rest are whole-domain array passes for the interface
+  bookkeeping and the surface terms), 11 ms the heat, rays and bubbles. The flow part scales
+  with the box.
+* **Conservation.** The box is surrounded by a 4-cell halo that is a wall for the step (gas
+  included), and only the inside is written back; liquid cells left touching gas at the box
+  edge are restored to interface cells. Mass and energy are conserved to 1e-13 (also with the
+  box changing size every 25 steps).
+* **Agreement with the full run.** T3 at 6 µm, 240 µm track: keyhole depth 110.1 ± 6.8 against
+  109.8 ± 5.7 µm, melted volume and absorbed energy within 2 %. Cell by cell the runs differ:
+  this melt flow is sensitive (perturbing the full run's populations by 1e-6 changes the melted
+  volume of a small test case by a quarter), so only statistics compare.
+* **Speed.** On that small 6 µm check only 1.1× (the box is nearly the whole 57 × 25 × 34
+  domain). For the production runs, the box share from the saved sections is about 0.5 for T3
+  and 0.4 for M200 (taking the full width in y, an upper bound): about 1.8× and 2.1× on the
+  L4 profile. To be measured on the GPU (`--profile` times the window parts).
+
 ### Keyhole oscillations and pinch-offs
 
 `tools/lbm/keyhole_spectrum.py RUN.json ... --out docs/img/keyhole_spectrum.png` (the
