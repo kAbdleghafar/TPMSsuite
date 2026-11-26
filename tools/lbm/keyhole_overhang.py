@@ -105,6 +105,9 @@ def main():
                     help="float32: several times faster on GeForce GPUs; results go to *_f32* files")
     ap.add_argument("--profile", type=int, default=0, metavar="N",
                     help="time N steps (after 30 warm-up steps), print where the time goes, and exit")
+    ap.add_argument("--window", action="store_true",
+                    help="run the flow only in a box around the hot metal and the beam (heat everywhere): "
+                         "2-3x faster when the melt fills a small part of the domain")
     ap.add_argument("--snapshots", type=float, default=0.0, metavar="US",
                     help="write the whole 3-D domain every US microseconds to <tag>_snap/ (0: off), for "
                          "ParaView movies; about 10 MB per snapshot for a turn run")
@@ -112,6 +115,8 @@ def main():
     ap.add_argument("--out", default=os.path.join(HERE, "keyhole_runs"))
     a = ap.parse_args()
     md, path, laser, info = build(a)
+    md.window = a.window
+    info["window"] = a.window
     os.makedirs(a.out, exist_ok=True)
     tag = f"overhang_slab{a.slab * 1e6:.0f}um_dx{a.dx * 1e6:g}um" + ("_f32" if a.dtype == "float32" else "")
     info["dtype"] = a.dtype
@@ -186,7 +191,7 @@ def main():
     Tl = md.Tl
     melted_below = (res.T_peak[:, :, 1:k_slab] > Tl) & (res.fill[:, :, 1:k_slab] > 0.5)
     info.update(mass_error=res.mass_error, energy_balance=res.energy_balance, energy_residual=res.energy_residual,
-                steps=res.steps, seconds=res.seconds, mlups=res.mlups,
+                steps=res.steps, seconds=res.seconds, window_stats=dict(md.window_stats), mlups=res.mlups,
                 dross_um3=float(melted_below.sum() * (dx * 1e6) ** 3),
                 dross_depth_um=float((k_slab - 1 - np.nonzero(melted_below.any(axis=(0, 1)))[0].min()) * dx * 1e6)
                 if melted_below.any() else 0.0)

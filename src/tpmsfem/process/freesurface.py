@@ -867,9 +867,159 @@ class FreeSurfaceMeltPool:
         self.bubbles = None
         self.bubble_every = 10
         self._bubble_dp = None
+        # active window: with ``window`` on, the flow (surface terms, solid/liquid coupling,
+        # lattice step) runs only in a box around the hot metal and the beam, from below the
+        # deepest hot cell up to the top of the domain (gas and spatter included). Outside it
+        # the metal is solid (Darcy-damped, it does not move in the full model either) and the
+        # gas is empty, so the flow there is frozen; the heat step, the ray tracer, the bubbles
+        # and the surface losses still cover the whole domain. Metal in the box's halo is a
+        # wall for the lattice (no-slip, mass conserved), and only the box interior is written
+        # back. With nothing hot and the laser off the flow step is skipped altogether.
+        # The halo (gas included) is a wall, so the box must keep the moving surface well
+        # inside it: ``window_margin`` cells around the hot metal and the beam zone.
+        self.window = False
+        self.window_margin = 6             # cells around the hot metal and the beam zone
+        self.window_T_margin = 150.0       # [degC] metal this far below the solidus counts as hot
+        self.window_halo = 4               # frozen cells around the box on its inner faces
+        self.window_full = 0.85            # above this share of the domain: no window
+        self.window_stats = dict(steps=0, windowed=0, skipped=0, cell_share=0.0)
+        self._delta_cache = None           # (lbm step, surface area per interface cell) outside the box
         # heat-capacity floor of nearly empty interface cells: low enough to hold their heat,
         # high enough for the explicit conduction step to stay stable (6 alpha dt / dx^2 / cap < 1)
         self.eps_min = max(0.1, 1.25 * 6.0 * float(alpha.max()) * self.dt / dx ** 2)
+
+    # ------------------------------------------------------------------ active window
+    def _window_box(self, xl, yl, radius):
+        """Slices (x, y, z) of the active box with its halo; None when nothing can flow (no
+        hot metal, laser off); the whole domain when the box would be nearly as large."""
+        dx = self.dx
+        nx, ny, nz = self.shape
+        m = self.metal()
+        hot = m & (self.T >= self.Ts - self.window_T_margin)
+        lo, hi = [None] * 3, [None] * 3
+        for a, axes in enumerate(((1, 2), (0, 2), (0, 1))):
+            idx = np.flatnonzero(asnumpy(hot.any(axis=axes)))
+            if idx.size:
+                lo[a], hi[a] = int(idx[0]), int(idx[-1])
+        if xl is not None:                    # the beam zone: where the rays deposit
+            R = (self.rays.box if self.rays is not None else 3.0) * radius / dx + 4
+            ic, jc = xl / dx, yl / dx
+            b = [(int(np.floor(ic - R)), int(np.ceil(ic + R))), (int(np.floor(jc - R)), int(np.ceil(jc + R)))]
+            for a in range(2):
+                lo[a] = b[a][0] if lo[a] is None else min(lo[a], b[a][0])
+                hi[a] = b[a][1] if hi[a] is None else max(hi[a], b[a][1])
+            i0, i1 = max(b[0][0], 0), min(b[0][1] + 1, nx)
+            j0, j1 = max(b[1][0], 0), min(b[1][1] + 1, ny)
+            col = np.flatnonzero(asnumpy(m[i0:i1, j0:j1, :].any(axis=(0, 1))))
+            top = int(col[-1]) if col.size else nz - 1
+            kb = int(top - R)
+            lo[2] = kb if lo[2] is None else min(lo[2], kb)
+        if lo[0] is None:
+            return None
+        pad = self.window_margin + self.window_halo
+        sl = (slice(max(lo[0] - pad, 0), min(hi[0] + pad + 1, nx)),
+              slice(max(lo[1] - pad, 0), min(hi[1] + pad + 1, ny)),
+              slice(max(lo[2] - pad, 0), nz))
+        share = np.prod([s.stop - s.start for s in sl]) / float(nx * ny * nz)
+        if share >= self.window_full:
+            return (slice(0, nx), slice(0, ny), slice(0, nz))
+        return sl
+
+    def _surface_delta(self):
+        """Surface area per interface cell [in dx^2], as in ``_surface_terms`` (cached for the
+        losses outside the active box, refreshed every 100 lattice steps)."""
+        xp = self.xp
+        key = self.lbm.steps // 100
+        if self._delta_cache is not None and self._delta_cache[0] == key:
+            return self._delta_cache[1]
+        flag = self.lbm.flag
+        gas = flag == GAS
+        n_arr, _ = self.lbm.normal_curvature(1)
+        faces = xp.zeros(self.shape, dtype=self.dtype)
+        for ax in range(3):
+            faces += xp.roll(gas, -1, ax).astype(self.dtype) + xp.roll(gas, 1, ax).astype(self.dtype)
+        l1 = xp.maximum(xp.abs(n_arr[0]) + xp.abs(n_arr[1]) + xp.abs(n_arr[2]), 1.0)
+        delta = xp.where(flag == INTERFACE, faces / l1, 0.0)
+        self._delta_cache = (key, delta)
+        return delta
+
+    def _outside_loss(self):
+        """Radiation and evaporation [W/m^3] of the whole surface, from the cached surface
+        area: the losses of the (cold, static) surface outside the active box."""
+        if self.emissivity <= 0.0 and self.evaporation is None:
+            return None
+        xp, dx, T = self.xp, self.dx, self.T
+        q = xp.zeros(self.shape, dtype=self.dtype)
+        if self.emissivity > 0.0:
+            q += self.emissivity * 5.670374419e-8 * ((T + 273.15) ** 4 - (self.T_amb + 273.15) ** 4)
+        if self.evaporation is not None:
+            q += self.evaporation.flux(T, xp) * 1e3
+        return xp.where(self.metal(), q * self._surface_delta() / dx, 0.0)
+
+    def _window_flow(self, sl):
+        """Surface terms, coupling and one lattice step in the box ``sl``; returns the surface
+        loss over the whole domain."""
+        import copy
+        xp = self.xp
+        full = tuple(self.shape)
+        W = copy.copy(self)
+        L = copy.copy(self.lbm)
+        W.lbm = L
+
+        def cut(obj):
+            for k, v in list(vars(obj).items()):
+                if isinstance(v, xp.ndarray) and v.ndim >= 3 and tuple(v.shape[-3:]) == full:
+                    setattr(obj, k, xp.ascontiguousarray(v[(Ellipsis,) + sl]))
+        cut(W)
+        cut(L)
+        ws = tuple(s.stop - s.start for s in sl)
+        W.shape = L.shape = ws
+        L._nk_cache = None
+        W._delta_cache = None
+        # the halo on the inner faces is a wall for this step, gas included: no mass may be
+        # handed to a halo cell (filling interface cells share their excess with neighbouring
+        # new interface cells), since the halo is not written back
+        h = self.window_halo
+        isl, fsl = [], []
+        for a, s in enumerate(sl):
+            a0 = 0 if s.start == 0 else h
+            a1 = ws[a] if s.stop == full[a] else ws[a] - h
+            isl.append(slice(a0, a1))
+            fsl.append(slice(s.start + a0, s.start + a1))
+        isl, fsl = tuple(isl), tuple(fsl)
+        inner = xp.zeros(ws, bool)
+        inner[isl] = True
+        L.flag = xp.where(inner, L.flag, WALL).astype(np.int8)
+        # class methods, not instance attributes: a profiler may have wrapped the full model's
+        # methods, and those wrappers (copied with the instance) would step the whole domain
+        loss_w = type(W)._surface_terms(W)
+        type(W)._couple(W)
+        L.h = W.H
+        type(L).step(L)
+        W.H = L.h
+        W.T = xp.where(W.metal(), W._T_of_H(W.H), W.T)
+        for full_obj, win_obj, names in ((self.lbm, L, ("f", "flag", "mass", "rho", "u", "kappa")),
+                                         (self, W, ("H", "T"))):
+            for k in names:
+                getattr(full_obj, k)[(Ellipsis,) + fsl] = getattr(win_obj, k)[(Ellipsis,) + isl]
+        self.lbm.h = self.H
+        # a surface cell at the box edge sees the halo as wall and may have turned liquid next to
+        # real gas beyond it; restore the interface layer (as _close_layer: mass = density, so
+        # conservative), or that cell would stream from the gas once the box moves
+        fl = self.lbm.flag
+        bad = (fl == LIQUID) & self.lbm._any_nb(fl == GAS)
+        if bool(bad.any()):
+            self.lbm.flag = xp.where(bad, INTERFACE, fl).astype(np.int8)
+        for k in ("lost_mass", "h_residual", "limited", "fragments_removed", "steps"):
+            setattr(self.lbm, k, getattr(L, k))
+        self.recoil_clipped = W.recoil_clipped
+        loss = self._outside_loss()
+        if loss_w is not None:
+            loss[fsl] = loss_w[isl]
+        st = self.window_stats
+        st["windowed"] += 1
+        st["cell_share"] += float(np.prod(ws)) / float(np.prod(full))
+        return loss
 
     # ------------------------------------------------------------------ helpers
     def _T_of_H(self, H):
@@ -1174,18 +1324,32 @@ class FreeSurfaceMeltPool:
                 q_rays = None
             if self.bubbles is not None and not frozen_flow and n % self.bubble_every == 0:
                 self._bubble_dp = self.bubbles.update(self.lbm.flag, self.lbm.fill, self.T, self.Ts)
-            loss = self._surface_terms()
-            if not frozen_flow:
-                self._couple()
-                before = self.metal()
-                if self.energy_transport == "lbm":
-                    self.lbm.h = self.H
-                    self.lbm.step()
-                    self.H = self.lbm.h
-                    self.T = xp.where(self.metal(), self._T_of_H(self.H), self.T)
-                else:
-                    self.lbm.step()
-                    self._new_metal_cells(before)
+            mode, win = "full", None
+            if self.window and not frozen_flow and self.energy_transport == "lbm":
+                win = self._window_box(xl, yl, laser.radius)
+                self.window_stats["steps"] += 1
+                if win is None:
+                    mode = "skip"
+                elif tuple(s.stop - s.start for s in win) != tuple(self.shape):
+                    mode = "window"
+            if mode == "skip":                       # nothing hot, laser off: the flow is frozen
+                loss = self._outside_loss()
+                self.window_stats["skipped"] += 1
+            elif mode == "window":
+                loss = self._window_flow(win)
+            else:
+                loss = self._surface_terms()
+                if not frozen_flow:
+                    self._couple()
+                    before = self.metal()
+                    if self.energy_transport == "lbm":
+                        self.lbm.h = self.H
+                        self.lbm.step()
+                        self.H = self.lbm.h
+                        self.T = xp.where(self.metal(), self._T_of_H(self.H), self.T)
+                    else:
+                        self.lbm.step()
+                        self._new_metal_cells(before)
             e_in, e_out = self._heat_step(q if q is not None else 0.0, loss)
             absorbed += e_in
             self.lost += e_out

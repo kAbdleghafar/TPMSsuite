@@ -54,6 +54,10 @@ def profile(md, laser, path, n_steps=300, warmup=30):
         wrap(md, "_new_metal_cells", "new cells")
     if md.bubbles is not None:
         wrap(md.bubbles, "update", "bubbles")
+    if getattr(md, "window", False):
+        wrap(md, "_window_flow", "flow in the window (surface terms, coupling, lattice)")
+        wrap(md, "_window_box", "window box")
+        wrap(md, "_outside_loss", "losses outside the window")
     count = dict(n=0, t0=None)
 
     def cb(m, t, x, y):

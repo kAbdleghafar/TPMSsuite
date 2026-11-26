@@ -380,3 +380,47 @@ def test_depth_spectrum_finds_the_oscillation():
     s2 = depth_spectrum(t, d + bell, smooth=100e-6, f_min=2e3)
     assert s2["f_peak"] == pytest.approx(7e3, abs=s2["df"])
     assert s2["band_fraction"]["<1kHz"] < 0.15                 # measured 0.06 (raw: 0.75)
+
+
+def test_active_window_matches_full_domain():
+    """The flow run only in a box around the hot metal and the beam: mass and energy conserved
+    exactly, as in the full run; the same absorbed energy and, within the spread of this
+    sensitive flow, the same melted volume; a box well below the domain size; and no flow
+    step at all while nothing is hot and the laser is off.
+
+    (This small melt pool is very sensitive: perturbing the full run's populations by 1e-6
+    changes its melted volume by a quarter, so cell-by-cell agreement is not expected.)"""
+    import tpmsfem as tf
+    from tpmsfem.fem.materials import ThermalProperties
+    from tpmsfem.process import Laser, ScanVector
+    from tpmsfem.process.freesurface import FreeSurfaceMeltPool
+
+    th = ThermalProperties.from_si([0.0, 20000.0], [30.0, 30.0], [800.0, 800.0], 4000.0, 2.9e5, 1600.0, 1660.0)
+    mat = tf.Material("const", 110_000.0, 0.3, thermal=th)
+    h = 5e-6
+
+    def make(window):
+        metal = np.zeros((60, 14, 18), bool)
+        metal[1:-1, 1:-1, 1:11] = True
+        m = FreeSurfaceMeltPool(mat, h, metal, dt=h / 250, viscosity=3e-3, sigma=1.6, T0=25.0, dsigma_dT=-2.6e-4,
+                                energy_transport="lbm")
+        m.window = window
+        return m
+
+    res, md = {}, {}
+    for window in (False, True):
+        md[window] = make(window)
+        res[window] = md[window].run(Laser(60.0, 0.4, 10e-6), [ScanVector(h + 30e-6, 7 * h, h + 70e-6, 7 * h, 2.0)],
+                                     t_extra=40e-6)
+    for w in (False, True):
+        assert abs(res[w].mass_error) < 1e-12
+        assert abs(res[w].energy_balance + res[w].energy_residual) < 1e-9
+    assert res[True].absorbed == pytest.approx(res[False].absorbed, rel=1e-2)
+    melted = {w: int((res[w].T_peak >= 1600.0).sum()) for w in res}
+    assert melted[True] == pytest.approx(melted[False], rel=0.35)
+    st = md[True].window_stats
+    assert st["windowed"] > 0 and st["cell_share"] / st["windowed"] < 0.6
+    # cold, laser off: the flow is frozen, every step skipped
+    cold = make(True)
+    r = cold.run(Laser(0.0, 0.4, 10e-6), [], t_extra=2e-6)
+    assert cold.window_stats["skipped"] == r.steps and abs(r.mass_error) < 1e-14

@@ -214,6 +214,9 @@ def main():
                     help="float32: several times faster on GeForce GPUs; results go to *_f32* files")
     ap.add_argument("--profile", type=int, default=0, metavar="N",
                     help="time N steps (after 30 warm-up steps), print where the time goes, and exit")
+    ap.add_argument("--window", action="store_true",
+                    help="run the flow only in a box around the hot metal and the beam (heat everywhere): "
+                         "2-3x faster when the melt fills a small part of the domain")
     ap.add_argument("--snapshots", type=float, default=0.0, metavar="US",
                     help="write the whole 3-D domain every US microseconds to <tag>_snap/ (0: off), for "
                          "ParaView movies; about 10 MB per snapshot for a turn run")
@@ -221,6 +224,8 @@ def main():
     ap.add_argument("--out", default=os.path.join(HERE, "keyhole_runs"))
     args = ap.parse_args()
     md, path, laser, info = build(args)
+    md.window = args.window
+    info["window"] = args.window
     os.makedirs(args.out, exist_ok=True)
     tag = (f"{args.case}_dx{args.dx * 1e6:g}um" if info["scenario"] == "track"
            else f"{args.case}_{info['scenario']}_dx{args.dx * 1e6:g}um")
@@ -317,7 +322,7 @@ def main():
           f"dt {info['dt'] * 1e9:.0f} ns, tau {md.tau:.4f}", flush=True)
     res = md.run(laser, path, t_extra=args.cool, callback=cb, callback_every=every)
     info.update(log=log, finished=True, mass_error=res.mass_error, energy_balance=res.energy_balance,
-                energy_residual=res.energy_residual, absorbed_J=res.absorbed, steps=res.steps, seconds=res.seconds,
+                energy_residual=res.energy_residual, absorbed_J=res.absorbed, steps=res.steps, seconds=res.seconds, window_stats=dict(md.window_stats),
                 mlups=res.mlups)
     final = dict(flag=res.flag.astype(np.int8), fill=res.fill.astype(np.float16), T_peak=res.T_peak.astype(np.float16))
     np.savez_compressed(os.path.join(args.out, f"{tag}_final.npz"), **final)
