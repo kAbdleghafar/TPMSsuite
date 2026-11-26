@@ -901,8 +901,11 @@ class FreeSurfaceMeltPool:
             idx = np.flatnonzero(asnumpy(hot.any(axis=axes)))
             if idx.size:
                 lo[a], hi[a] = int(idx[0]), int(idx[-1])
-        if xl is not None:                    # the beam zone: where the rays deposit
-            R = (self.rays.box if self.rays is not None else 3.0) * radius / dx + 4
+        if xl is not None:
+            # the beam spot: the metal it is about to melt. Rays reflected further out heat the
+            # metal there (the heat step covers the whole domain), and a cell warmed to within
+            # window_T_margin of the solidus joins the box at the next step.
+            R = 1.5 * radius / dx + 2
             ic, jc = xl / dx, yl / dx
             b = [(int(np.floor(ic - R)), int(np.ceil(ic + R))), (int(np.floor(jc - R)), int(np.ceil(jc + R)))]
             for a in range(2):
